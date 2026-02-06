@@ -1,13 +1,16 @@
 mod config;
 mod registry;
 mod blueprint;
+mod dashboard;
 
 use clap::{Parser, Subcommand};
 use anyhow::{Result, Context};
 use config::{Config, Environment};
 use registry::{Registry, ImageMetadata};
 use blueprint::Blueprint;
+use dashboard::Dashboard;
 use inquire::{Select, Confirm};
+use std::process::Command;
 use chrono::Utc;
 use std::fs;
 
@@ -81,7 +84,24 @@ async fn main() -> Result<()> {
             if Confirm::new("Apply these changes to the local YAML file?").with_default(true).prompt()? {
                 fs::write(&yaml_path, &updated_content)
                     .with_context(|| format!("Failed to write updated YAML to {}", yaml_path.display()))?;
-                println!("Local YAML updated. Ready for Phase 5 (kubectl apply).");
+                
+                println!("Local YAML updated. Executing kubectl apply...");
+                
+                let output = Command::new("kubectl")
+                    .args(["--context", &selected_env.kubectl_context, "apply", "-f", yaml_path.to_str().unwrap()])
+                    .output()
+                    .context("Failed to execute kubectl apply")?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(anyhow::anyhow!("kubectl apply failed: {}", stderr));
+                }
+
+                println!("Deployment applied. Starting dashboard...");
+                
+                let mut dashboard = Dashboard::new(selected_service, selected_env.name, selected_tag);
+                dashboard.run().await.context("Dashboard error")?;
+
             } else {
                 println!("Deployment cancelled. No changes made.");
             }
