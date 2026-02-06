@@ -12,7 +12,7 @@ use ratatui::{
     style::{Color, Style, Modifier},
     Frame, Terminal,
 };
-use kube::{Client, Api, api::{ListParams, LogParams}};
+use kube::{Client, Api, api::{ListParams, LogParams}, config::KubeConfigOptions};
 use k8s_openapi::api::core::v1::Pod;
 use tokio::sync::mpsc;
 use futures::StreamExt;
@@ -21,6 +21,10 @@ pub struct Dashboard {
     service: String,
     env_name: String,
     tag: String,
+    kubectl_context: String,
+    namespace: Option<String>,
+    selector: Option<String>,
+    container_name: String,
     pods: Vec<PodInfo>,
     old_logs: Vec<String>,
     new_logs: Vec<String>,
@@ -42,12 +46,16 @@ struct PodInfo {
 }
 
 impl Dashboard {
-    pub fn new(service: String, env_name: String, tag: String) -> Self {
+    pub fn new(service: String, env_name: String, tag: String, kubectl_context: String, namespace: Option<String>, selector: Option<String>, container_name: String) -> Self {
         let (log_tx, log_rx) = mpsc::unbounded_channel();
         Self {
             service,
             env_name,
             tag,
+            kubectl_context,
+            namespace,
+            selector,
+            container_name,
             pods: Vec::new(),
             old_logs: Vec::new(),
             new_logs: Vec::new(),
@@ -64,7 +72,12 @@ impl Dashboard {
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
 
-        let client = Client::try_default().await.context("Failed to create K8s client")?;
+        let options = KubeConfigOptions {
+            context: Some(self.kubectl_context.clone()),
+            ..Default::default()
+        };
+        let config = kube::Config::from_kubeconfig(&options).await.context("Failed to load kubeconfig")?;
+        let client = Client::try_from(config).context("Failed to create K8s client")?;
         
         let res = self.run_loop(&mut terminal, client).await;
 
@@ -82,8 +95,11 @@ impl Dashboard {
     async fn run_loop<B: Backend>(&mut self, terminal: &mut Terminal<B>, client: Client) -> Result<()> 
     where B::Error: std::fmt::Display
     {
-        let pods_api: Api<Pod> = Api::default_namespaced(client.clone());
-        let lp = ListParams::default().labels(&format!("app={}", self.service));
+        let ns = self.namespace.as_deref().unwrap_or("default");
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), ns);
+        
+        let selector = self.selector.clone().unwrap_or_else(|| format!("app={}", self.service));
+        let lp = ListParams::default().labels(&selector);
 
         loop {
             // 1. Update pod list
@@ -105,23 +121,33 @@ impl Dashboard {
                         let tx = self.log_tx.clone();
                         let api = pods_api.clone();
                         let p_name = name.clone();
+                        let container = self.container_name.clone();
                         tokio::spawn(async move {
                             let mut lp = LogParams::default();
                             lp.follow = true;
                             lp.tail_lines = Some(10);
+                            lp.container = Some(container);
 
-                            if let Ok(stream) = api.log_stream(&p_name, &lp).await {
-                                use futures::io::AsyncBufReadExt;
-                                let mut lines = stream.lines();
-                                while let Some(res) = lines.next().await {
-                                    if let Ok(line) = res {
-                                        let line: String = line;
-                                        let _ = tx.send(LogLine { 
-                                            pod_name: p_name.clone(), 
-                                            content: line.trim().to_string(), 
-                                            is_new 
-                                        });
+                            match api.log_stream(&p_name, &lp).await {
+                                Ok(stream) => {
+                                    use futures::io::AsyncBufReadExt;
+                                    let mut lines = stream.lines();
+                                    while let Some(res) = lines.next().await {
+                                        if let Ok(line) = res {
+                                            let _ = tx.send(LogLine { 
+                                                pod_name: p_name.clone(), 
+                                                content: line.trim().to_string(), 
+                                                is_new 
+                                            });
+                                        }
                                     }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(LogLine {
+                                        pod_name: p_name,
+                                        content: format!("Error streaming logs: {}", e),
+                                        is_new
+                                    });
                                 }
                             }
                         });

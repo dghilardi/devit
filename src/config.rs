@@ -32,7 +32,10 @@ pub struct Environment {
 pub struct ServiceSource {
     pub name: String,
     pub image_path: String,
+    pub container_name: String,
     pub yaml_path: std::path::PathBuf,
+    pub namespace: Option<String>,
+    pub selector: Option<String>,
 }
 
 impl Environment {
@@ -98,11 +101,28 @@ impl Environment {
 
         // Search for images in the spec
         if let Some(spec) = resource.get("spec") {
-            if let Some(image_path) = self.find_gcr_image(spec) {
+            if let Some((image_path, container_name)) = self.find_gcr_image(spec) {
+                let namespace = metadata.get("namespace").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let mut selector = None;
+                
+                // Extract app label selector
+                if let Some(sel) = spec.get("selector") {
+                    if let Some(match_labels) = sel.get("matchLabels") {
+                        if let Some(app) = match_labels.get("app") {
+                            if let Some(app_str) = app.as_str() {
+                                selector = Some(format!("app={}", app_str));
+                            }
+                        }
+                    }
+                }
+
                 return Some(ServiceSource {
                     name: name.to_string(),
                     image_path,
+                    container_name,
                     yaml_path: yaml_path.to_path_buf(),
+                    namespace,
+                    selector,
                 });
             }
         }
@@ -110,22 +130,22 @@ impl Environment {
         None
     }
 
-    fn find_gcr_image(&self, value: &serde_yaml::Value) -> Option<String> {
-        if let Some(image) = value.as_str() {
-            if image.contains("gcr.io") || image.contains("pkg.dev") {
-                return Some(image.to_string());
-            }
-        }
-
+    fn find_gcr_image(&self, value: &serde_yaml::Value) -> Option<(String, String)> {
         if let Some(map) = value.as_mapping() {
-            for (k, v) in map {
-                if k.as_str() == Some("image") {
-                    if let Some(img_str) = v.as_str() {
-                        if img_str.contains("gcr.io") || img_str.contains("pkg.dev") {
-                            return Some(img_str.to_string());
-                        }
+            // Check if this mapping is a container definition
+            if let Some(image_val) = map.get(&serde_yaml::Value::String("image".to_string())) {
+                if let Some(img_str) = image_val.as_str() {
+                    if img_str.contains("gcr.io") || img_str.contains("pkg.dev") {
+                        let container_name = map.get(&serde_yaml::Value::String("name".to_string()))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("default")
+                            .to_string();
+                        return Some((img_str.to_string(), container_name));
                     }
                 }
+            }
+
+            for (_k, v) in map {
                 if let Some(found) = self.find_gcr_image(v) {
                     return Some(found);
                 }
@@ -198,11 +218,18 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gcr-service
+  namespace: test-ns
 spec:
+  selector:
+    matchLabels:
+      app: gcr-service-app
   template:
+    metadata:
+      labels:
+        app: gcr-service-app
     spec:
       containers:
-      - name: main
+      - name: gcr-container
         image: gcr.io/my-project/my-image:latest
 "#)?;
 
@@ -264,11 +291,14 @@ spec:
         
         let gcr_service = services.iter().find(|s| s.name == "gcr-service").unwrap();
         assert_eq!(gcr_service.image_path, "gcr.io/my-project/my-image:latest");
-        assert!(gcr_service.yaml_path.to_str().unwrap().contains("deploy-gcr.yaml"));
+        assert_eq!(gcr_service.container_name, "gcr-container");
+        assert!(gcr_service.yaml_path.to_str().unwrap().contains("deploy.yaml"));
+        assert_eq!(gcr_service.selector, Some("app=gcr-service-app".to_string()));
+        assert_eq!(gcr_service.namespace, Some("test-ns".to_string()));
 
         let pkg_service = services.iter().find(|s| s.name == "pkg-service").unwrap();
         assert_eq!(pkg_service.image_path, "europe-west1-docker.pkg.dev/my-project/my-repo/my-image:v1");
-        assert!(pkg_service.yaml_path.to_str().unwrap().contains("deploy-pkg.yaml"));
+        assert!(pkg_service.yaml_path.to_str().unwrap().contains("statefulset.yaml"));
 
         assert!(!services.iter().any(|s| s.name == "not-a-microservice"));
         assert!(!services.iter().any(|s| s.name == "dockerhub-service"));

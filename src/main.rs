@@ -141,7 +141,15 @@ async fn main() -> Result<()> {
 
                 println!("Deployment applied. Starting dashboard...");
                 
-                let mut dashboard = Dashboard::new(selected_service.name.clone(), selected_env.name.clone(), selected_tag.clone());
+                let mut dashboard = Dashboard::new(
+                    selected_service.name.clone(),
+                    selected_env.name.clone(),
+                    selected_tag.clone(),
+                    selected_env.kubectl_context.clone(),
+                    selected_service.namespace.clone(),
+                    selected_service.selector.clone(),
+                    selected_service.container_name.clone(),
+                );
                 let res = dashboard.run().await;
 
                 if let Err(e) = res {
