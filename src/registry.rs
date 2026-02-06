@@ -43,8 +43,9 @@ impl ImageMetadata {
 pub struct Registry;
 
 impl Registry {
-    pub fn fetch_images(project: &str, location: &str, repository: &str, package: &str) -> Result<Vec<ImageMetadata>> {
-        let image_path = format!("{}-docker.pkg.dev/{}/{}/{}", location, project, repository, package);
+    pub fn fetch_images(image_path: &str) -> Result<Vec<ImageMetadata>> {
+        // Strip tag if present (e.g. gcr.io/repo/image:latest -> gcr.io/repo/image)
+        let base_image = image_path.split(':').next().unwrap_or(image_path);
         
         let output = Command::new("gcloud")
             .args([
@@ -52,7 +53,7 @@ impl Registry {
                 "docker",
                 "images",
                 "list",
-                &image_path,
+                base_image,
                 "--format=json",
                 "--sort-by=~updateTime",
             ])

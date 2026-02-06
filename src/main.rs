@@ -6,7 +6,7 @@ mod git;
 
 use clap::{Parser, Subcommand};
 use anyhow::{Result, Context};
-use config::{Config, Environment};
+use config::{Config, Environment, ServiceSource};
 use registry::{Registry, ImageMetadata};
 use blueprint::Blueprint;
 use dashboard::Dashboard;
@@ -84,7 +84,7 @@ async fn main() -> Result<()> {
             }
 
             // Phase 4 - YAML modification & Visual Diff
-            let yaml_path = Blueprint::find_deployment_yaml(&selected_env.repo_root, &selected_service)
+            let yaml_path = Blueprint::find_deployment_yaml(&selected_env.repo_root, &selected_service.name)
                 .context("Failed to find deployment YAML file")?;
             
             let original_content = fs::read_to_string(&yaml_path)
@@ -118,7 +118,7 @@ async fn main() -> Result<()> {
 
                 println!("Deployment applied. Starting dashboard...");
                 
-                let mut dashboard = Dashboard::new(selected_service.clone(), selected_env.name.clone(), selected_tag.clone());
+                let mut dashboard = Dashboard::new(selected_service.name.clone(), selected_env.name.clone(), selected_tag.clone());
                 let res = dashboard.run().await;
 
                 if let Err(e) = res {
@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
 
                 // 6.1 Git Automation
                 println!("Deployment successful. Committing changes...");
-                let commit_msg = format!("deploy({}): update {} to {}", selected_env.name, selected_service, selected_tag);
+                let commit_msg = format!("deploy({}): update {} to {}", selected_env.name, selected_service.name, selected_tag);
                 if let Err(e) = Git::commit_and_push(&selected_env.repo_root, &commit_msg, &yaml_path) {
                     println!("⚠️  Failed to commit/push changes: {}", e);
                 } else {
@@ -175,7 +175,7 @@ fn resolve_environment(config: &Config, input: Option<String>) -> Result<Environ
         .context("Environment not found in config")
 }
 
-fn resolve_service(env: &Environment, input: Option<String>) -> Result<String> {
+fn resolve_service(env: &Environment, input: Option<String>) -> Result<ServiceSource> {
     let services = env.list_services()
         .context("Failed to list services in repo_root")?;
     
@@ -183,24 +183,30 @@ fn resolve_service(env: &Environment, input: Option<String>) -> Result<String> {
         return Err(anyhow::anyhow!("No services found in {}", env.repo_root.display()));
     }
 
-    match input {
-        Some(val) => resolve_from_list("Service", &services, val),
-        None => {
-            Select::new("Select Service:", services)
-                .prompt()
-                .context("Service selection was cancelled")
+    let service_name = match input {
+        Some(val) => {
+            let names: Vec<String> = services.iter().map(|s| s.name.clone()).collect();
+            resolve_from_list("Service", &names, val)?
         }
-    }
+        None => {
+            let names: Vec<String> = services.iter().map(|s| s.name.clone()).collect();
+            Select::new("Select Service:", names)
+                .prompt()
+                .context("Service selection was cancelled")?
+        }
+    };
+
+    services.into_iter()
+        .find(|s| s.name == service_name)
+        .context("Resolved service not found in list")
 }
 
-fn resolve_tag(env: &Environment, service: &String) -> Result<String> {
+fn resolve_tag(env: &Environment, service: &ServiceSource) -> Result<String> {
     let project = env.gcp_project.as_deref().unwrap_or("MOCK_PROJECT");
-    let location = env.gcp_location.as_deref().unwrap_or("europe-west1");
-    let repository = env.gcp_repository.as_deref().unwrap_or("MOCK_REPO");
 
-    println!("Fetching images for {} from {}...", service, repository);
+    println!("Fetching images for {} using path {}...", service.name, service.image_path);
     
-    let images = match Registry::fetch_images(project, location, repository, service) {
+    let images = match Registry::fetch_images(&service.image_path) {
         Ok(imgs) => imgs,
         Err(e) => {
             if project == "MOCK_PROJECT" {
@@ -212,7 +218,7 @@ fn resolve_tag(env: &Environment, service: &String) -> Result<String> {
     };
 
     if images.is_empty() {
-        return Err(anyhow::anyhow!("No images found for service {}", service));
+        return Err(anyhow::anyhow!("No images found for service {}", service.name));
     }
 
     let options: Vec<String> = images.iter()

@@ -28,8 +28,14 @@ pub struct Environment {
     pub protected: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ServiceSource {
+    pub name: String,
+    pub image_path: String,
+}
+
 impl Environment {
-    pub fn list_services(&self) -> Result<Vec<String>> {
+    pub fn list_services(&self) -> Result<Vec<ServiceSource>> {
         let mut services = HashSet::new();
         if !self.repo_root.exists() {
             return Ok(Vec::new());
@@ -57,8 +63,8 @@ impl Environment {
                                 
                                 match serde_yaml::from_str::<serde_yaml::Value>(doc) {
                                     Ok(resource) => {
-                                        if let Some(service_name) = self.extract_gcr_service(&resource) {
-                                            services.insert(service_name);
+                                        if let Some(source) = self.extract_gcr_service(&resource) {
+                                            services.insert(source);
                                         }
                                     }
                                     Err(e) => eprintln!("Failed to parse YAML doc in {:?}: {}", path, e),
@@ -71,11 +77,11 @@ impl Environment {
         }
 
         let mut sorted_services = services.into_iter().collect::<Vec<_>>();
-        sorted_services.sort();
+        sorted_services.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(sorted_services)
     }
 
-    fn extract_gcr_service(&self, resource: &serde_yaml::Value) -> Option<String> {
+    fn extract_gcr_service(&self, resource: &serde_yaml::Value) -> Option<ServiceSource> {
         let kind = resource.get("kind")?.as_str()?;
         let metadata = resource.get("metadata")?;
         let name = metadata.get("name")?.as_str()?;
@@ -87,17 +93,22 @@ impl Environment {
 
         // Search for images in the spec
         if let Some(spec) = resource.get("spec") {
-            if self.has_gcr_image(spec) {
-                return Some(name.to_string());
+            if let Some(image_path) = self.find_gcr_image(spec) {
+                return Some(ServiceSource {
+                    name: name.to_string(),
+                    image_path,
+                });
             }
         }
 
         None
     }
 
-    fn has_gcr_image(&self, value: &serde_yaml::Value) -> bool {
+    fn find_gcr_image(&self, value: &serde_yaml::Value) -> Option<String> {
         if let Some(image) = value.as_str() {
-            return image.contains("gcr.io") || image.contains("pkg.dev");
+            if image.contains("gcr.io") || image.contains("pkg.dev") {
+                return Some(image.to_string());
+            }
         }
 
         if let Some(map) = value.as_mapping() {
@@ -105,25 +116,25 @@ impl Environment {
                 if k.as_str() == Some("image") {
                     if let Some(img_str) = v.as_str() {
                         if img_str.contains("gcr.io") || img_str.contains("pkg.dev") {
-                            return true;
+                            return Some(img_str.to_string());
                         }
                     }
                 }
-                if self.has_gcr_image(v) {
-                    return true;
+                if let Some(found) = self.find_gcr_image(v) {
+                    return Some(found);
                 }
             }
         }
 
         if let Some(seq) = value.as_sequence() {
             for v in seq {
-                if self.has_gcr_image(v) {
-                    return true;
+                if let Some(found) = self.find_gcr_image(v) {
+                    return Some(found);
                 }
             }
         }
 
-        false
+        None
     }
 }
 
@@ -244,10 +255,15 @@ spec:
 
         let services = env.list_services()?;
         assert_eq!(services.len(), 2);
-        assert!(services.contains(&"gcr-service".to_string()));
-        assert!(services.contains(&"pkg-service".to_string()));
-        assert!(!services.contains(&"not-a-microservice".to_string()));
-        assert!(!services.contains(&"dockerhub-service".to_string()));
+        
+        let gcr_service = services.iter().find(|s| s.name == "gcr-service").unwrap();
+        assert_eq!(gcr_service.image_path, "gcr.io/my-project/my-image:latest");
+
+        let pkg_service = services.iter().find(|s| s.name == "pkg-service").unwrap();
+        assert_eq!(pkg_service.image_path, "europe-west1-docker.pkg.dev/my-project/my-repo/my-image:v1");
+
+        assert!(!services.iter().any(|s| s.name == "not-a-microservice"));
+        assert!(!services.iter().any(|s| s.name == "dockerhub-service"));
 
         Ok(())
     }
