@@ -1,9 +1,12 @@
 mod config;
+mod registry;
 
 use clap::{Parser, Subcommand};
 use anyhow::{Result, Context};
 use config::{Config, Environment};
+use registry::{Registry, ImageMetadata};
 use inquire::{Select, Confirm};
+use chrono::Utc;
 
 #[derive(Parser)]
 #[command(name = "davit")]
@@ -54,12 +57,18 @@ async fn main() -> Result<()> {
             let selected_env = resolve_environment(&config, env)?;
             let selected_service = resolve_service(&selected_env, service)?;
             
+            let selected_tag = if let Some(t) = tag {
+                t
+            } else {
+                resolve_tag(&selected_env, &selected_service)?
+            };
+
             println!("Ready to deploy:");
             println!("  Environment: {}", selected_env.name);
             println!("  Service:     {}", selected_service);
-            println!("  Tag:         {:?}", tag);
+            println!("  Tag:         {}", selected_tag);
             
-            // TODO: Phase 3 - Image selection/Tag resolution
+            // TODO: Phase 4 - YAML modification & Visual Diff
         }
         Commands::Config { command } => match command {
             ConfigCommands::Show => {
@@ -109,6 +118,75 @@ fn resolve_service(env: &Environment, input: Option<String>) -> Result<String> {
                 .context("Service selection was cancelled")
         }
     }
+}
+
+fn resolve_tag(env: &Environment, service: &String) -> Result<String> {
+    let project = env.gcp_project.as_deref().unwrap_or("MOCK_PROJECT");
+    let location = env.gcp_location.as_deref().unwrap_or("europe-west1");
+    let repository = env.gcp_repository.as_deref().unwrap_or("MOCK_REPO");
+
+    println!("Fetching images for {} from {}...", service, repository);
+    
+    // In a real scenario, this would call Registry::fetch_images.
+    // For Phase 3 verification, we'll implement a fallback to mock data if gcloud fails or project is MOCK.
+    let images = match Registry::fetch_images(project, location, repository, service) {
+        Ok(imgs) => imgs,
+        Err(e) => {
+            if project == "MOCK_PROJECT" {
+                mock_images()
+            } else {
+                return Err(e).context("Failed to fetch images from Artifact Registry");
+            }
+        }
+    };
+
+    if images.is_empty() {
+        return Err(anyhow::anyhow!("No images found for service {}", service));
+    }
+
+    let options: Vec<String> = images.iter()
+        .map(|img| {
+            format!("{:<15} ({}) [{}]", 
+                img.display_tag(), 
+                img.age_string(), 
+                img.short_hash())
+        })
+        .collect();
+
+    let selection = Select::new("Select Image Tag:", options)
+        .prompt()
+        .context("Image selection was cancelled")?;
+
+    // Extract the tag from the selection string. 
+    // The tag part is before the first space, and we strip any trailing commas.
+    let tag = selection.split_whitespace()
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(',')
+        .to_string();
+    Ok(tag)
+}
+
+fn mock_images() -> Vec<ImageMetadata> {
+    use chrono::Duration;
+    let now = Utc::now();
+    vec![
+        ImageMetadata {
+            tags: vec!["v1.2.3".to_string(), "latest".to_string()],
+            update_time: now - Duration::hours(2),
+            name: "auth-service@sha256:abcdef123456789".to_string(),
+        },
+        ImageMetadata {
+            tags: vec!["v1.2.2".to_string()],
+            update_time: now - Duration::days(1),
+            name: "auth-service@sha256:123456789abcdef".to_string(),
+        },
+        ImageMetadata {
+            tags: vec!["v1.1.0".to_string()],
+            update_time: now - Duration::days(5),
+            name: "auth-service@sha256:987654321fedcba".to_string(),
+        },
+    ]
 }
 
 /// Generic disambiguation logic

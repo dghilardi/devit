@@ -20,6 +20,9 @@ pub struct Environment {
     pub name: String,
     pub repo_root: PathBuf,
     pub kubectl_context: String,
+    pub gcp_project: Option<String>,
+    pub gcp_location: Option<String>,
+    pub gcp_repository: Option<String>,
     pub protected: Option<bool>,
 }
 
