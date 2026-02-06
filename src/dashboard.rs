@@ -36,6 +36,8 @@ pub struct Dashboard {
 struct LogLine {
     pod_name: String,
     content: String,
+    level: Option<String>,
+    timestamp: Option<String>,
     is_new: bool,
 }
 
@@ -134,11 +136,42 @@ impl Dashboard {
                                     let mut lines = stream.lines();
                                     while let Some(res) = lines.next().await {
                                         if let Ok(line) = res {
-                                            let _ = tx.send(LogLine { 
-                                                pod_name: p_name.clone(), 
-                                                content: line.trim().to_string(), 
-                                                is_new 
-                                            });
+                                            let raw_content = line.trim().to_string();
+                                            let mut log_line = LogLine {
+                                                pod_name: p_name.clone(),
+                                                content: raw_content.clone(),
+                                                level: None,
+                                                timestamp: None,
+                                                is_new,
+                                            };
+                                            
+                                            // Attempt JSON parsing
+                                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw_content) {
+                                                // Extract level - GKE uses 'severity', others 'level'
+                                                log_line.level = v.get("severity")
+                                                    .or_else(|| v.get("level"))
+                                                    .and_then(|l| l.as_str())
+                                                    .map(|s| s.to_uppercase());
+                                                
+                                                // Extract timestamp - GKE 'timestamp', others 'time' or 'timestamp'
+                                                log_line.timestamp = v.get("timestamp")
+                                                    .or_else(|| v.get("time"))
+                                                    .and_then(|t| t.as_str())
+                                                    .map(|s| s.to_string());
+                                                
+                                                // Extract message - GKE 'message', others 'message' or 'msg' or 'fields.message'
+                                                let msg = v.get("message")
+                                                    .or_else(|| v.get("msg"))
+                                                    .or_else(|| v.get("textPayload"))
+                                                    .or_else(|| v.get("fields").and_then(|f| f.get("message")))
+                                                    .and_then(|m| m.as_str());
+                                                
+                                                if let Some(m) = msg {
+                                                    log_line.content = m.to_string();
+                                                }
+                                            }
+
+                                            let _ = tx.send(log_line);
                                         }
                                     }
                                 }
@@ -146,6 +179,8 @@ impl Dashboard {
                                     let _ = tx.send(LogLine {
                                         pod_name: p_name,
                                         content: format!("Error streaming logs: {}", e),
+                                        level: Some("ERROR".to_string()),
+                                        timestamp: None,
                                         is_new
                                     });
                                 }
@@ -160,11 +195,12 @@ impl Dashboard {
 
             // 2. Consume logs
             while let Ok(log) = self.log_rx.try_recv() {
+                let display_line = self.format_log_line(&log);
                 if log.is_new {
-                    self.new_logs.push(format!("[{}] {}", log.pod_name.split('-').last().unwrap_or(""), log.content));
+                    self.new_logs.push(display_line);
                     if self.new_logs.len() > 100 { self.new_logs.remove(0); }
                 } else {
-                    self.old_logs.push(format!("[{}] {}", log.pod_name.split('-').last().unwrap_or(""), log.content));
+                    self.old_logs.push(display_line);
                     if self.old_logs.len() > 100 { self.old_logs.remove(0); }
                 }
             }
@@ -181,6 +217,18 @@ impl Dashboard {
                 }
             }
         }
+    }
+
+    fn format_log_line(&self, log: &LogLine) -> String {
+        let pod_id = log.pod_name.split('-').last().unwrap_or("");
+        let ts = log.timestamp.as_deref()
+            .and_then(|t| t.split('T').last())
+            .map(|t| t.split('.').next().unwrap_or(t))
+            .map(|t| format!("{} ", t))
+            .unwrap_or_default();
+        
+        let level = log.level.as_deref().unwrap_or("INFO");
+        format!("[{}] {}{} {}", pod_id, ts, level, log.content)
     }
 
     fn ui(&self, f: &mut Frame) {
@@ -219,12 +267,28 @@ impl Dashboard {
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[2]);
 
-        let old_logs: Vec<ListItem> = self.old_logs.iter().rev().take(50).map(|l| ListItem::new(l.as_str()).style(Style::default().fg(Color::DarkGray))).collect();
+        let old_logs: Vec<ListItem> = self.old_logs.iter().rev().take(50).map(|l| {
+            let style = self.get_log_style(l, Color::DarkGray);
+            ListItem::new(l.as_str()).style(style)
+        }).collect();
         let old_list = List::new(old_logs).block(Block::default().title(" Old Pod Logs ").borders(Borders::ALL));
         f.render_widget(old_list, log_chunks[0]);
 
-        let new_logs: Vec<ListItem> = self.new_logs.iter().rev().take(50).map(|l| ListItem::new(l.as_str()).style(Style::default().fg(Color::Green))).collect();
+        let new_logs: Vec<ListItem> = self.new_logs.iter().rev().take(50).map(|l| {
+            let style = self.get_log_style(l, Color::Green);
+            ListItem::new(l.as_str()).style(style)
+        }).collect();
         let new_list = List::new(new_logs).block(Block::default().title(" New Pod Logs ").borders(Borders::ALL));
         f.render_widget(new_list, log_chunks[1]);
+    }
+
+    fn get_log_style(&self, line: &str, default_color: Color) -> Style {
+        if line.contains("ERROR") || line.contains("FATAL") {
+            Style::default().fg(Color::Red)
+        } else if line.contains("WARN") {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(default_color)
+        }
     }
 }
