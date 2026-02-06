@@ -1,12 +1,15 @@
 mod config;
 mod registry;
+mod blueprint;
 
 use clap::{Parser, Subcommand};
 use anyhow::{Result, Context};
 use config::{Config, Environment};
 use registry::{Registry, ImageMetadata};
+use blueprint::Blueprint;
 use inquire::{Select, Confirm};
 use chrono::Utc;
+use std::fs;
 
 #[derive(Parser)]
 #[command(name = "davit")]
@@ -63,12 +66,25 @@ async fn main() -> Result<()> {
                 resolve_tag(&selected_env, &selected_service)?
             };
 
-            println!("Ready to deploy:");
-            println!("  Environment: {}", selected_env.name);
-            println!("  Service:     {}", selected_service);
-            println!("  Tag:         {}", selected_tag);
+            // Phase 4 - YAML modification & Visual Diff
+            let yaml_path = Blueprint::find_deployment_yaml(&selected_env.repo_root, &selected_service)
+                .context("Failed to find deployment YAML file")?;
             
-            // TODO: Phase 4 - YAML modification & Visual Diff
+            let original_content = fs::read_to_string(&yaml_path)
+                .with_context(|| format!("Failed to read YAML file at {}", yaml_path.display()))?;
+            
+            let updated_content = Blueprint::update_image_tag(&original_content, &selected_tag)
+                .context("Failed to update image tag in YAML")?;
+
+            Blueprint::show_diff(&original_content, &updated_content, yaml_path.file_name().and_then(|n| n.to_str()).unwrap_or("deployment.yaml"));
+
+            if Confirm::new("Apply these changes to the local YAML file?").with_default(true).prompt()? {
+                fs::write(&yaml_path, &updated_content)
+                    .with_context(|| format!("Failed to write updated YAML to {}", yaml_path.display()))?;
+                println!("Local YAML updated. Ready for Phase 5 (kubectl apply).");
+            } else {
+                println!("Deployment cancelled. No changes made.");
+            }
         }
         Commands::Config { command } => match command {
             ConfigCommands::Show => {
@@ -127,8 +143,6 @@ fn resolve_tag(env: &Environment, service: &String) -> Result<String> {
 
     println!("Fetching images for {} from {}...", service, repository);
     
-    // In a real scenario, this would call Registry::fetch_images.
-    // For Phase 3 verification, we'll implement a fallback to mock data if gcloud fails or project is MOCK.
     let images = match Registry::fetch_images(project, location, repository, service) {
         Ok(imgs) => imgs,
         Err(e) => {
@@ -157,8 +171,6 @@ fn resolve_tag(env: &Environment, service: &String) -> Result<String> {
         .prompt()
         .context("Image selection was cancelled")?;
 
-    // Extract the tag from the selection string. 
-    // The tag part is before the first space, and we strip any trailing commas.
     let tag = selection.split_whitespace()
         .next()
         .unwrap_or("")
