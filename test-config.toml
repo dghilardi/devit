@@ -1,0 +1,5 @@
+[[environments]]
+name = "prod-test"
+repo_root = "/home/davide/development/personal/davit/test-repo"
+kubectl_context = "kind-kind"
+protected = true

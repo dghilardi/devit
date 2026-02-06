@@ -2,6 +2,7 @@ mod config;
 mod registry;
 mod blueprint;
 mod dashboard;
+mod git;
 
 use clap::{Parser, Subcommand};
 use anyhow::{Result, Context};
@@ -9,7 +10,8 @@ use config::{Config, Environment};
 use registry::{Registry, ImageMetadata};
 use blueprint::Blueprint;
 use dashboard::Dashboard;
-use inquire::{Select, Confirm};
+use git::Git;
+use inquire::{Select, Confirm, Text};
 use std::process::Command;
 use chrono::Utc;
 use std::fs;
@@ -69,6 +71,18 @@ async fn main() -> Result<()> {
                 resolve_tag(&selected_env, &selected_service)?
             };
 
+            // 6.3 Production Protection
+            if selected_env.protected.unwrap_or(false) {
+                println!("⚠️  WARNING: Deployment to {} is PROTECTED!", selected_env.name);
+                let confirmation = Text::new(&format!("Type the environment name '{}' to confirm:", selected_env.name))
+                    .prompt()
+                    .context("Production confirmation was cancelled")?;
+                
+                if confirmation != selected_env.name {
+                    return Err(anyhow::anyhow!("Confirmation failed. Deployment aborted."));
+                }
+            }
+
             // Phase 4 - YAML modification & Visual Diff
             let yaml_path = Blueprint::find_deployment_yaml(&selected_env.repo_root, &selected_service)
                 .context("Failed to find deployment YAML file")?;
@@ -94,13 +108,36 @@ async fn main() -> Result<()> {
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
-                    return Err(anyhow::anyhow!("kubectl apply failed: {}", stderr));
+                    println!("❌ kubectl apply failed: {}", stderr);
+                    if Confirm::new("Revert local YAML changes?").with_default(true).prompt()? {
+                        fs::write(&yaml_path, &original_content)?;
+                        println!("YAML reverted.");
+                    }
+                    return Err(anyhow::anyhow!("kubectl apply failed"));
                 }
 
                 println!("Deployment applied. Starting dashboard...");
                 
-                let mut dashboard = Dashboard::new(selected_service, selected_env.name, selected_tag);
-                dashboard.run().await.context("Dashboard error")?;
+                let mut dashboard = Dashboard::new(selected_service.clone(), selected_env.name.clone(), selected_tag.clone());
+                let res = dashboard.run().await;
+
+                if let Err(e) = res {
+                    println!("❌ Dashboard error or aborted: {}", e);
+                    if Confirm::new("Revert local YAML changes?").with_default(true).prompt()? {
+                        fs::write(&yaml_path, &original_content)?;
+                        println!("YAML reverted.");
+                    }
+                    return Err(e);
+                }
+
+                // 6.1 Git Automation
+                println!("Deployment successful. Committing changes...");
+                let commit_msg = format!("deploy({}): update {} to {}", selected_env.name, selected_service, selected_tag);
+                if let Err(e) = Git::commit_and_push(&selected_env.repo_root, &commit_msg, &yaml_path) {
+                    println!("⚠️  Failed to commit/push changes: {}", e);
+                } else {
+                    println!("✅ Changes committed and pushed to Git.");
+                }
 
             } else {
                 println!("Deployment cancelled. No changes made.");
