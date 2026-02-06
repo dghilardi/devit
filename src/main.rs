@@ -94,15 +94,37 @@ async fn main() -> Result<()> {
             let updated_content = Blueprint::update_image_tag(&original_content, base_image, &selected_tag)
                 .context("Failed to update image tag in YAML")?;
 
-            Blueprint::show_diff(&original_content, &updated_content, yaml_path.file_name().and_then(|n| n.to_str()).unwrap_or("deployment.yaml"));
+            let mut show_unified = true;
+            let filename = yaml_path.file_name().and_then(|n| n.to_str()).unwrap_or("deployment.yaml");
 
-            if Confirm::new("Apply these changes to the local YAML file?").with_default(true).prompt()? {
-                fs::write(&yaml_path, &updated_content)
-                    .with_context(|| format!("Failed to write updated YAML to {}", yaml_path.display()))?;
-                
-                println!("Local YAML updated. Executing kubectl apply...");
-                
-                let output = Command::new("kubectl")
+            loop {
+                Blueprint::show_diff(&original_content, &updated_content, filename, show_unified);
+
+                let choices = if show_unified {
+                    vec!["Apply", "Show full diff", "Dismiss"]
+                } else {
+                    vec!["Apply", "Show unified diff", "Dismiss"]
+                };
+
+                let selection = Select::new("Action:", choices).prompt()?;
+
+                match selection {
+                    "Apply" => {
+                        fs::write(&yaml_path, &updated_content)
+                            .with_context(|| format!("Failed to write updated YAML to {}", yaml_path.display()))?;
+                        println!("Local YAML updated. Executing kubectl apply...");
+                        break;
+                    }
+                    "Show full diff" => show_unified = false,
+                    "Show unified diff" => show_unified = true,
+                    _ => {
+                        println!("Deployment cancelled. No changes made.");
+                        return Ok(());
+                    }
+                }
+            }
+            
+            let output = Command::new("kubectl")
                     .args(["--context", &selected_env.kubectl_context, "apply", "-f", yaml_path.to_str().unwrap()])
                     .output()
                     .context("Failed to execute kubectl apply")?;
@@ -139,10 +161,6 @@ async fn main() -> Result<()> {
                 } else {
                     println!("✅ Changes committed and pushed to Git.");
                 }
-
-            } else {
-                println!("Deployment cancelled. No changes made.");
-            }
         }
         Commands::Config { command } => match command {
             ConfigCommands::Show => {

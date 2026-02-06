@@ -1,9 +1,7 @@
-use std::path::{Path, PathBuf};
-use std::fs;
-use anyhow::{Result, Context};
+use anyhow::Result;
 use regex::Regex;
 use similar::{ChangeTag, TextDiff};
-use console::{style, Term};
+use console::style;
 
 pub struct Blueprint;
 
@@ -31,29 +29,62 @@ impl Blueprint {
     }
 
     /// Displays a colored diff between old and new content.
-    pub fn show_diff(old: &str, new: &str, filename: &str) {
+    pub fn show_diff(old: &str, new: &str, filename: &str, unified: bool) {
         println!("\n{} {}", style("---").dim(), style(filename).bold());
         println!("{} {}", style("+++").dim(), style(filename).bold());
 
         let diff = TextDiff::from_lines(old, new);
 
-        for change in diff.iter_all_changes() {
-            let (sign, color) = match change.tag() {
-                ChangeTag::Delete => ("-", "red"),
-                ChangeTag::Insert => ("+", "green"),
-                ChangeTag::Equal => (" ", "white"),
-            };
-            
-            let line = change.to_string();
-            let styled_line = if color == "red" {
-                style(format!("{}{}", sign, line)).red()
-            } else if color == "green" {
-                style(format!("{}{}", sign, line)).green()
-            } else {
-                style(format!("{}{}", sign, line)).dim()
-            };
+        if unified {
+            for group in diff.grouped_ops(3) {
+                for op in group {
+                    match op {
+                        similar::DiffOp::Equal { old_index, len, .. } => {
+                            for line in &diff.old_slices()[old_index..old_index + len] {
+                                print!(" {}", style(line).dim());
+                            }
+                        }
+                        similar::DiffOp::Delete { old_index, old_len, .. } => {
+                            for line in &diff.old_slices()[old_index..old_index + old_len] {
+                                print!("-{}", style(line).red());
+                            }
+                        }
+                        similar::DiffOp::Insert { new_index, new_len, .. } => {
+                            for line in &diff.new_slices()[new_index..new_index + new_len] {
+                                print!("+{}", style(line).green());
+                            }
+                        }
+                        similar::DiffOp::Replace { old_index, old_len, new_index, new_len } => {
+                            for line in &diff.old_slices()[old_index..old_index + old_len] {
+                                print!("-{}", style(line).red());
+                            }
+                            for line in &diff.new_slices()[new_index..new_index + new_len] {
+                                print!("+{}", style(line).green());
+                            }
+                        }
+                    }
+                }
+                println!("{}", style("@@ ... @@").cyan());
+            }
+        } else {
+            for change in diff.iter_all_changes() {
+                let (sign, color) = match change.tag() {
+                    ChangeTag::Delete => ("-", "red"),
+                    ChangeTag::Insert => ("+", "green"),
+                    ChangeTag::Equal => (" ", "white"),
+                };
+                
+                let line = change.to_string();
+                let styled_line = if color == "red" {
+                    style(format!("{}{}", sign, line)).red()
+                } else if color == "green" {
+                    style(format!("{}{}", sign, line)).green()
+                } else {
+                    style(format!("{}{}", sign, line)).dim()
+                };
 
-            print!("{}", styled_line);
+                print!("{}", styled_line);
+            }
         }
         println!();
     }
