@@ -84,13 +84,14 @@ async fn main() -> Result<()> {
             }
 
             // Phase 4 - YAML modification & Visual Diff
-            let yaml_path = Blueprint::find_deployment_yaml(&selected_env.repo_root, &selected_service.name)
-                .context("Failed to find deployment YAML file")?;
+            let yaml_path = selected_service.yaml_path.clone();
             
             let original_content = fs::read_to_string(&yaml_path)
                 .with_context(|| format!("Failed to read YAML file at {}", yaml_path.display()))?;
             
-            let updated_content = Blueprint::update_image_tag(&original_content, &selected_tag)
+            let base_image = selected_service.image_path.split([':', '@']).next().unwrap_or(&selected_service.image_path);
+            
+            let updated_content = Blueprint::update_image_tag(&original_content, base_image, &selected_tag)
                 .context("Failed to update image tag in YAML")?;
 
             Blueprint::show_diff(&original_content, &updated_content, yaml_path.file_name().and_then(|n| n.to_str()).unwrap_or("deployment.yaml"));

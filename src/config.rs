@@ -32,6 +32,7 @@ pub struct Environment {
 pub struct ServiceSource {
     pub name: String,
     pub image_path: String,
+    pub yaml_path: std::path::PathBuf,
 }
 
 impl Environment {
@@ -56,18 +57,22 @@ impl Environment {
                 if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                     if ext == "yaml" || ext == "yml" {
                         if let Ok(content) = fs::read_to_string(path) {
-                            for doc in content.split("---") {
-                                if doc.trim().is_empty() {
-                                    continue;
-                                }
-                                
-                                match serde_yaml::from_str::<serde_yaml::Value>(doc) {
+                            let deserializer = serde_yaml::Deserializer::from_str(&content);
+                            for document in deserializer {
+                                match serde_yaml::Value::deserialize(document) {
                                     Ok(resource) => {
-                                        if let Some(source) = self.extract_gcr_service(&resource) {
+                                        if let Some(source) = self.extract_gcr_service(&resource, path) {
                                             services.insert(source);
                                         }
                                     }
-                                    Err(e) => eprintln!("Failed to parse YAML doc in {:?}: {}", path, e),
+                                    Err(e) => {
+                                        let err_msg = e.to_string();
+                                        // Ignore "deserializing from YAML containing more than one document" if we are already using Deserializer
+                                        // But if it's another error, log it.
+                                        if !err_msg.contains("more than one document") {
+                                            eprintln!("Failed to parse YAML doc in {:?}: {}", path, e);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -81,7 +86,7 @@ impl Environment {
         Ok(sorted_services)
     }
 
-    fn extract_gcr_service(&self, resource: &serde_yaml::Value) -> Option<ServiceSource> {
+    fn extract_gcr_service(&self, resource: &serde_yaml::Value, yaml_path: &std::path::Path) -> Option<ServiceSource> {
         let kind = resource.get("kind")?.as_str()?;
         let metadata = resource.get("metadata")?;
         let name = metadata.get("name")?.as_str()?;
@@ -97,6 +102,7 @@ impl Environment {
                 return Some(ServiceSource {
                     name: name.to_string(),
                     image_path,
+                    yaml_path: yaml_path.to_path_buf(),
                 });
             }
         }
@@ -258,9 +264,11 @@ spec:
         
         let gcr_service = services.iter().find(|s| s.name == "gcr-service").unwrap();
         assert_eq!(gcr_service.image_path, "gcr.io/my-project/my-image:latest");
+        assert!(gcr_service.yaml_path.to_str().unwrap().contains("deploy-gcr.yaml"));
 
         let pkg_service = services.iter().find(|s| s.name == "pkg-service").unwrap();
         assert_eq!(pkg_service.image_path, "europe-west1-docker.pkg.dev/my-project/my-repo/my-image:v1");
+        assert!(pkg_service.yaml_path.to_str().unwrap().contains("deploy-pkg.yaml"));
 
         assert!(!services.iter().any(|s| s.name == "not-a-microservice"));
         assert!(!services.iter().any(|s| s.name == "dockerhub-service"));

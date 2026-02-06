@@ -8,40 +8,22 @@ use console::{style, Term};
 pub struct Blueprint;
 
 impl Blueprint {
-    /// Finds the deployment YAML file for a given service in the environment repo root.
-    pub fn find_deployment_yaml(repo_root: &Path, service: &str) -> Result<PathBuf> {
-        let service_dir = repo_root.join(service);
-        if !service_dir.exists() {
-            return Err(anyhow::anyhow!("Service directory not found: {}", service_dir.display()));
-        }
-
-        let candidates = ["deployment.yaml", "deployment.yml", "deploy.yaml", "deploy.yml"];
-        for candidate in candidates {
-            let path = service_dir.join(candidate);
-            if path.exists() {
-                return Ok(path);
-            }
-        }
-
-        Err(anyhow::anyhow!("Could not find a deployment YAML file in {}", service_dir.display()))
-    }
 
     /// Modifies the image tag in the YAML content while preserving formatting/comments.
     /// It searches for 'image: ...:<old_tag>' and replaces it.
-    pub fn update_image_tag(content: &str, new_tag: &str) -> Result<String> {
-        // This regex looks for 'image:' followed by some characters (the registry/image name),
-        // then a colon, and then a tag. We want to replace the tag.
-        // We assume the image line doesn't have comments on the same line after the tag for simplicity, 
-        // or we handle it by not matching past the end of the tag.
+    /// Modifies the image tag in the YAML content while preserving formatting/comments.
+    /// It searches for 'image: <base_image>:<old_tag>' and replaces it.
+    pub fn update_image_tag(content: &str, base_image: &str, new_tag: &str) -> Result<String> {
+        // Escape the base_image for regex safety
+        let escaped_base = regex::escape(base_image);
         
-        // Pattern: image: (anything up to a colon) : (anything that looks like a tag)
-        // Note: We need to be careful with images that use SHAs instead of tags (e.g. image@sha256:...)
-        // But the requirement says "update the tag".
-        
-        let re = Regex::new(r"(?m)^(\s*image:\s*[^:\s]+):[^\s#]+").unwrap();
+        // Pattern: image: <escaped_base_image> : (anything that looks like a tag)
+        // We look for the line that starts with 'image:' and contains our specific base_image.
+        let pattern = format!(r"(?m)^(\s*image:\s*{})[:@][^\s#]+", escaped_base);
+        let re = Regex::new(&pattern).unwrap();
         
         if !re.is_match(content) {
-            return Err(anyhow::anyhow!("Could not find 'image:' field in the YAML content"));
+            return Err(anyhow::anyhow!("Could not find 'image: {}' field in the YAML content", base_image));
         }
 
         let new_content = re.replace_all(content, format!("$1:{}", new_tag)).to_string();
@@ -74,5 +56,34 @@ impl Blueprint {
             print!("{}", styled_line);
         }
         println!();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_update_image_tag_with_sidecars() {
+        let content = r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: my-app
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: gcr.io/my-project/my-app:v1
+      - name: sidecar
+        image: haproxy:2.4
+"#;
+        let base_image = "gcr.io/my-project/my-app";
+        let new_tag = "v2";
+        let updated = Blueprint::update_image_tag(content, base_image, new_tag).unwrap();
+        
+        assert!(updated.contains("image: gcr.io/my-project/my-app:v2"));
+        assert!(updated.contains("image: haproxy:2.4"));
     }
 }
