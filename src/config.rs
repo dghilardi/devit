@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Result, Context};
 use directories::ProjectDirs;
 use std::fs;
+use std::collections::HashSet;
+use walkdir::WalkDir;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -28,24 +30,100 @@ pub struct Environment {
 
 impl Environment {
     pub fn list_services(&self) -> Result<Vec<String>> {
-        let mut services = Vec::new();
+        let mut services = HashSet::new();
         if !self.repo_root.exists() {
-            return Ok(services);
+            return Ok(Vec::new());
         }
 
-        for entry in fs::read_dir(&self.repo_root)? {
-            let entry = entry?;
+        for entry in WalkDir::new(&self.repo_root)
+            .into_iter()
+            .filter_entry(|e| {
+                if e.depth() == 0 {
+                    return true;
+                }
+                !e.file_name().to_str().map(|s| s.starts_with('.')).unwrap_or(false)
+            })
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if !name.starts_with('.') {
-                        services.push(name.to_string());
+            if path.is_file() {
+                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                    if ext == "yaml" || ext == "yml" {
+                        if let Ok(content) = fs::read_to_string(path) {
+                            for doc in content.split("---") {
+                                if doc.trim().is_empty() {
+                                    continue;
+                                }
+                                
+                                match serde_yaml::from_str::<serde_yaml::Value>(doc) {
+                                    Ok(resource) => {
+                                        if let Some(service_name) = self.extract_gcr_service(&resource) {
+                                            services.insert(service_name);
+                                        }
+                                    }
+                                    Err(e) => eprintln!("Failed to parse YAML doc in {:?}: {}", path, e),
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-        services.sort();
-        Ok(services)
+
+        let mut sorted_services = services.into_iter().collect::<Vec<_>>();
+        sorted_services.sort();
+        Ok(sorted_services)
+    }
+
+    fn extract_gcr_service(&self, resource: &serde_yaml::Value) -> Option<String> {
+        let kind = resource.get("kind")?.as_str()?;
+        let metadata = resource.get("metadata")?;
+        let name = metadata.get("name")?.as_str()?;
+
+        let microservice_kinds = ["Deployment", "StatefulSet", "DaemonSet", "Job", "CronJob"];
+        if !microservice_kinds.contains(&kind) {
+            return None;
+        }
+
+        // Search for images in the spec
+        if let Some(spec) = resource.get("spec") {
+            if self.has_gcr_image(spec) {
+                return Some(name.to_string());
+            }
+        }
+
+        None
+    }
+
+    fn has_gcr_image(&self, value: &serde_yaml::Value) -> bool {
+        if let Some(image) = value.as_str() {
+            return image.contains("gcr.io") || image.contains("pkg.dev");
+        }
+
+        if let Some(map) = value.as_mapping() {
+            for (k, v) in map {
+                if k.as_str() == Some("image") {
+                    if let Some(img_str) = v.as_str() {
+                        if img_str.contains("gcr.io") || img_str.contains("pkg.dev") {
+                            return true;
+                        }
+                    }
+                }
+                if self.has_gcr_image(v) {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(seq) = value.as_sequence() {
+            for v in seq {
+                if self.has_gcr_image(v) {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }
 
@@ -81,5 +159,96 @@ impl Config {
         config_path.push("config.toml");
         
         Ok(config_path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_list_services_gcr_filter() -> Result<()> {
+        let dir = tempdir()?;
+        let repo_root = dir.path().to_path_buf();
+
+        // 1. Valid Deployment with GCR image
+        let service1_dir = repo_root.join("service1");
+        fs::create_dir(&service1_dir)?;
+        fs::write(service1_dir.join("deploy.yaml"), r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gcr-service
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: gcr.io/my-project/my-image:latest
+"#)?;
+
+        // 2. Valid StatefulSet with Artifact Registry image
+        let service2_dir = repo_root.join("service2");
+        fs::create_dir(&service2_dir)?;
+        fs::write(service2_dir.join("statefulset.yaml"), r#"
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: pkg-service
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: europe-west1-docker.pkg.dev/my-project/my-repo/my-image:v1
+"#)?;
+
+        // 3. Invalid Kind (Service)
+        fs::write(repo_root.join("service.yaml"), r#"
+apiVersion: v1
+kind: Service
+metadata:
+  name: not-a-microservice
+spec:
+  ports:
+  - port: 80
+"#)?;
+
+        // 4. Invalid Image (Docker Hub)
+        let service3_dir = repo_root.join("service3");
+        fs::create_dir(&service3_dir)?;
+        fs::write(service3_dir.join("deploy.yaml"), r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dockerhub-service
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: nginx:latest
+"#)?;
+
+        let env = Environment {
+            name: "test".to_string(),
+            repo_root,
+            kubectl_context: "test".to_string(),
+            gcp_project: None,
+            gcp_location: None,
+            gcp_repository: None,
+            protected: None,
+        };
+
+        let services = env.list_services()?;
+        assert_eq!(services.len(), 2);
+        assert!(services.contains(&"gcr-service".to_string()));
+        assert!(services.contains(&"pkg-service".to_string()));
+        assert!(!services.contains(&"not-a-microservice".to_string()));
+        assert!(!services.contains(&"dockerhub-service".to_string()));
+
+        Ok(())
     }
 }
