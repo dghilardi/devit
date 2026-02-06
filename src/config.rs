@@ -15,12 +15,35 @@ pub struct Defaults {
     pub interactive: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Environment {
     pub name: String,
     pub repo_root: PathBuf,
     pub kubectl_context: String,
     pub protected: Option<bool>,
+}
+
+impl Environment {
+    pub fn list_services(&self) -> Result<Vec<String>> {
+        let mut services = Vec::new();
+        if !self.repo_root.exists() {
+            return Ok(services);
+        }
+
+        for entry in fs::read_dir(&self.repo_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if !name.starts_with('.') {
+                        services.push(name.to_string());
+                    }
+                }
+            }
+        }
+        services.sort();
+        Ok(services)
+    }
 }
 
 impl Config {
