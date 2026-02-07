@@ -59,12 +59,9 @@ The tool supports a hybrid workflow: "CLI for speed, TUI for discovery."
 
 **Input Logic:**
 
-1. **Full CLI:** `davit deploy --env staging --service auth --tag v1.2.0` → Runs immediately (with final confirmation).
-2. **Partial CLI:** `davit deploy --env staging` → Prompts for Service, then Tag.
-3. **No Args:** `davit deploy` → Starts the full wizard.
-
 **Smart Disambiguation Strategy:**
 
+* **YAML-based Discovery:** Instead of assuming a fixed directory structure, Davit recursively scans the `repo_root` for YAML files and identifies microservices by searching for GCR/Artifact Registry images within container specs.
 * **Exact Match:** User inputs `user-api`. Found 1 folder/service. -> **Select.**
 * **Partial Match (Unique):** User inputs `pay`. Only `payment-service` exists. -> **Prompt:** *"Did you mean 'payment-service'? (Y/n)"*
 * **Ambiguous Match:** User inputs `data`. Matches `data-ingest` and `database-proxy`. -> **Menu:** Show list of these two for selection.
@@ -72,8 +69,8 @@ The tool supports a hybrid workflow: "CLI for speed, TUI for discovery."
 
 ### 3.3 Artifact Registry Integration
 
-* **Source:** Google Artifact Registry (via `gcloud` wrapper or direct API).
-* **Sorting:** Reverse chronological (Newest `updateTime` at top).
+* **Source:** Google Artifact Registry (`pkg.dev`) and legacy Google Container Registry (`gcr.io`) via `gcloud` wrapper.
+* **Sorting:** Reverse chronological (Newest `updateTime` at top). Supports robust timestamp parsing for various `gcloud` output formats.
 * **Visuals:** The list must display:
 * **Tag** (e.g., `v1.0.4-fix`)
 * **Age** (e.g., `2 hours ago` - colored Green for recent, Grey for old)
@@ -85,7 +82,11 @@ The tool supports a hybrid workflow: "CLI for speed, TUI for discovery."
 
 Before touching the cluster, Davit modifies the YAML in memory or a temp file.
 
-* **Visual Diff:** A unified diff view (styled like `git diff`) showing specifically what is changing in the `deployment.yaml`.
+* **Unified Diff:** A context-aware diff view showing specifically what is changing in the discovered `yaml_path`.
+* **Interactive Selection:** After showing the diff, provide a menu with:
+    * **Apply:** Save change and proceed to deployment.
+    * **Show Full Diff:** Toggle between unified and complete file view.
+    * **Dismiss:** Abort the deployment.
 * **Context Check:** Prominently display: *"WARNING: You are targeting PRODUCTION"*.
 
 ### 3.5 The "Lowering" (Execution & Watch Phase)
@@ -129,6 +130,7 @@ Upon successful rollout (New Pod is Ready, Old Pod is Gone):
 ### 4.2 Reliability & Safety
 
 * **Atomic Revert:** If `kubectl apply` fails or the user aborts during the watch phase (Ctrl+C), Davit should offer to revert the local YAML file changes to the previous state.
+* **Targeted Tag Replacement:** Deployment logic must escape image names to ensure only the intended microservice container is updated, leaving sidecars (e.g. `haproxy`) untouched.
 * **Dependency Minimalist:** Should rely only on `kubectl`, `gcloud`, and `git` being present in `$PATH`.
 
 ---
