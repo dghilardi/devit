@@ -24,6 +24,7 @@ walkdir = "2.5"
 similar = "2.7.0"
 tokio = { version = "1.49.0", features = ["full"] }
 toml = "0.9.11"
+pathdiff = "0.2.3"
 
 [dev-dependencies]
 tempfile = "3.17.1"

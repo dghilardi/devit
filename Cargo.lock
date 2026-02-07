@@ -484,6 +484,7 @@ dependencies = [
  "inquire",
  "k8s-openapi",
  "kube",
+ "pathdiff",
  "ratatui",
  "regex",
  "serde",
@@ -1576,6 +1577,12 @@ dependencies = [
  "smallvec",
  "windows-link",
 ]
+
+[[package]]
+name = "pathdiff"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 
 [[package]]
 name = "pem"

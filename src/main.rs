@@ -242,6 +242,36 @@ fn resolve_environment(config: &Config, input: Option<String>) -> Result<Environ
         .context("Environment not found in config")
 }
 
+
+fn get_service_display_name(s: &ServiceSource, all_services: &[ServiceSource], env_yaml_dir: &std::path::Path) -> String {
+    let duplicates: Vec<&ServiceSource> = all_services.iter()
+        .filter(|&other| other.name == s.name)
+        .collect();
+
+    if duplicates.len() <= 1 {
+        return s.name.clone();
+    }
+
+    // Multiple services with same name, check namespace
+    let same_namespace: Vec<&&ServiceSource> = duplicates.iter()
+        .filter(|&other| other.namespace == s.namespace)
+        .collect();
+
+    if same_namespace.len() <= 1 {
+        return format!("{} ({})", s.name, s.namespace.as_deref().unwrap_or("no-namespace"));
+    }
+
+    // Multiple services with same name and same namespace, use relative path
+    let relative_path = pathdiff::diff_paths(&s.yaml_path, env_yaml_dir)
+        .unwrap_or_else(|| s.yaml_path.clone());
+    
+    format!("{} ({}) [{}]", 
+        s.name, 
+        s.namespace.as_deref().unwrap_or("no-namespace"),
+        relative_path.display()
+    )
+}
+
 fn resolve_service(env: &Environment, input: Option<String>) -> Result<ServiceSource> {
     let services = env.list_services()
         .context("Failed to list services in repo_root")?;
@@ -250,21 +280,27 @@ fn resolve_service(env: &Environment, input: Option<String>) -> Result<ServiceSo
         return Err(anyhow::anyhow!("No services found in {}", env.env_yaml_dir.display()));
     }
 
-    let service_name = match input {
+    let service_map: Vec<(String, ServiceSource)> = services.iter()
+        .cloned()
+        .map(|s| (get_service_display_name(&s, &services, &env.env_yaml_dir), s))
+        .collect();
+
+    let display_names: Vec<String> = service_map.iter().map(|(n, _)| n.clone()).collect();
+
+    let selected_name = match input {
         Some(val) => {
-            let names: Vec<String> = services.iter().map(|s| s.name.clone()).collect();
-            resolve_from_list("Service", &names, val)?
+            resolve_from_list("Service", &display_names, val)?
         }
         None => {
-            let names: Vec<String> = services.iter().map(|s| s.name.clone()).collect();
-            Select::new("Select Service:", names)
+            Select::new("Select Service:", display_names.clone())
                 .prompt()
                 .context("Service selection was cancelled")?
         }
     };
 
-    services.into_iter()
-        .find(|s| s.name == service_name)
+    service_map.into_iter()
+        .find(|(n, _)| n == &selected_name)
+        .map(|(_, s)| s)
         .context("Resolved service not found in list")
 }
 
@@ -369,5 +405,74 @@ fn resolve_from_list(label: &str, items: &[String], input: String) -> Result<Str
                 .prompt()
                 .context(format!("{} selection was cancelled", label))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_service_display_name_unique() {
+        let s = ServiceSource {
+            name: "service1".to_string(),
+            image_path: "img1".to_string(),
+            container_name: "c1".to_string(),
+            yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
+            namespace: Some("ns1".to_string()),
+            selector: None,
+        };
+        let all = vec![s.clone()];
+        let root = PathBuf::from("/root");
+        assert_eq!(get_service_display_name(&s, &all, &root), "service1");
+    }
+
+    #[test]
+    fn test_service_display_name_duplicate_name() {
+        let s1 = ServiceSource {
+            name: "service1".to_string(),
+            image_path: "img1".to_string(),
+            container_name: "c1".to_string(),
+            yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
+            namespace: Some("ns1".to_string()),
+            selector: None,
+        };
+        let s2 = ServiceSource {
+            name: "service1".to_string(),
+            image_path: "img2".to_string(),
+            container_name: "c2".to_string(),
+            yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
+            namespace: Some("ns2".to_string()),
+            selector: None,
+        };
+        let all = vec![s1.clone(), s2.clone()];
+        let root = PathBuf::from("/root");
+        assert_eq!(get_service_display_name(&s1, &all, &root), "service1 (ns1)");
+        assert_eq!(get_service_display_name(&s2, &all, &root), "service1 (ns2)");
+    }
+
+    #[test]
+    fn test_service_display_name_duplicate_name_and_ns() {
+        let s1 = ServiceSource {
+            name: "service1".to_string(),
+            image_path: "img1".to_string(),
+            container_name: "c1".to_string(),
+            yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
+            namespace: Some("ns1".to_string()),
+            selector: None,
+        };
+        let s2 = ServiceSource {
+            name: "service1".to_string(),
+            image_path: "img2".to_string(),
+            container_name: "c2".to_string(),
+            yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
+            namespace: Some("ns1".to_string()),
+            selector: None,
+        };
+        let all = vec![s1.clone(), s2.clone()];
+        let root = PathBuf::from("/root");
+        assert_eq!(get_service_display_name(&s1, &all, &root), "service1 (ns1) [dir1/deploy.yaml]");
+        assert_eq!(get_service_display_name(&s2, &all, &root), "service1 (ns1) [dir2/deploy.yaml]");
     }
 }
