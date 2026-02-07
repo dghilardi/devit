@@ -20,7 +20,7 @@ pub struct Defaults {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Environment {
     pub name: String,
-    pub repo_root: PathBuf,
+    pub env_yaml_dir: PathBuf,
     pub kubectl_context: String,
     pub gcp_project: Option<String>,
     pub gcp_location: Option<String>,
@@ -41,11 +41,11 @@ pub struct ServiceSource {
 impl Environment {
     pub fn list_services(&self) -> Result<Vec<ServiceSource>> {
         let mut services = HashSet::new();
-        if !self.repo_root.exists() {
+        if !self.env_yaml_dir.exists() {
             return Ok(Vec::new());
         }
 
-        for entry in WalkDir::new(&self.repo_root)
+        for entry in WalkDir::new(&self.env_yaml_dir)
             .into_iter()
             .filter_entry(|e| {
                 if e.depth() == 0 {
@@ -208,10 +208,10 @@ mod tests {
     #[test]
     fn test_list_services_gcr_filter() -> Result<()> {
         let dir = tempdir()?;
-        let repo_root = dir.path().to_path_buf();
+        let env_yaml_dir = dir.path().to_path_buf();
 
         // 1. Valid Deployment with GCR image
-        let service1_dir = repo_root.join("service1");
+        let service1_dir = env_yaml_dir.join("service1");
         fs::create_dir(&service1_dir)?;
         fs::write(service1_dir.join("deploy.yaml"), r#"
 apiVersion: apps/v1
@@ -234,7 +234,7 @@ spec:
 "#)?;
 
         // 2. Valid StatefulSet with Artifact Registry image
-        let service2_dir = repo_root.join("service2");
+        let service2_dir = env_yaml_dir.join("service2");
         fs::create_dir(&service2_dir)?;
         fs::write(service2_dir.join("statefulset.yaml"), r#"
 apiVersion: apps/v1
@@ -250,7 +250,7 @@ spec:
 "#)?;
 
         // 3. Invalid Kind (Service)
-        fs::write(repo_root.join("service.yaml"), r#"
+        fs::write(env_yaml_dir.join("service.yaml"), r#"
 apiVersion: v1
 kind: Service
 metadata:
@@ -261,7 +261,7 @@ spec:
 "#)?;
 
         // 4. Invalid Image (Docker Hub)
-        let service3_dir = repo_root.join("service3");
+        let service3_dir = env_yaml_dir.join("service3");
         fs::create_dir(&service3_dir)?;
         fs::write(service3_dir.join("deploy.yaml"), r#"
 apiVersion: apps/v1
@@ -278,7 +278,7 @@ spec:
 
         let env = Environment {
             name: "test".to_string(),
-            repo_root,
+            env_yaml_dir,
             kubectl_context: "test".to_string(),
             gcp_project: None,
             gcp_location: None,

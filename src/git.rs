@@ -5,21 +5,44 @@ use anyhow::{Result, Context};
 pub struct Git;
 
 impl Git {
-    /// Checks if the given directory is a git repository.
+    /// Checks if the given directory is inside a git repository.
     pub fn is_repo(path: &Path) -> bool {
-        path.join(".git").exists()
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("rev-parse")
+            .arg("--is-inside-work-tree")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// Performs a git pull.
+    pub fn pull(path: &Path) -> Result<()> {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("pull")
+            .status()
+            .context("Failed to execute git pull")?;
+        
+        if !status.success() {
+            return Err(anyhow::anyhow!("git pull failed"));
+        }
+
+        Ok(())
     }
 
     /// Adds, commits and pushes the change.
-    pub fn commit_and_push(repo_root: &Path, message: &str, file: &Path) -> Result<()> {
-        if !Self::is_repo(repo_root) {
-            return Err(anyhow::anyhow!("Not a git repository: {}", repo_root.display()));
+    pub fn commit_and_push(path: &Path, message: &str, file: &Path) -> Result<()> {
+        if !Self::is_repo(path) {
+            return Err(anyhow::anyhow!("Not inside a git repository: {}", path.display()));
         }
 
         // git add <file>
         let status = Command::new("git")
             .arg("-C")
-            .arg(repo_root)
+            .arg(path)
             .arg("add")
             .arg(file)
             .status()
@@ -32,7 +55,7 @@ impl Git {
         // git commit -m <message>
         let status = Command::new("git")
             .arg("-C")
-            .arg(repo_root)
+            .arg(path)
             .arg("commit")
             .arg("-m")
             .arg(message)
@@ -46,7 +69,7 @@ impl Git {
         // git push
         let status = Command::new("git")
             .arg("-C")
-            .arg(repo_root)
+            .arg(path)
             .arg("push")
             .status()
             .context("Failed to execute git push")?;

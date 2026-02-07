@@ -63,6 +63,19 @@ async fn main() -> Result<()> {
     match cli.command {
         Commands::Deploy { env, service, tag } => {
             let selected_env = resolve_environment(&config, env)?;
+            
+            // Phase 6.2 - Git Pull before deployment
+            println!("🔄 Checking for updates in {}...", selected_env.env_yaml_dir.display());
+            if let Err(e) = Git::pull(&selected_env.env_yaml_dir) {
+                println!("⚠️  Git pull failed: {}", e);
+                if !Confirm::new("Do you want to continue with the deployment anyway?")
+                    .with_default(false)
+                    .prompt()? 
+                {
+                    return Err(anyhow::anyhow!("Deployment aborted by user after git pull failure."));
+                }
+            }
+
             let selected_service = resolve_service(&selected_env, service)?;
             
             let selected_tag = if let Some(t) = tag {
@@ -162,12 +175,25 @@ async fn main() -> Result<()> {
                 }
 
                 // 6.1 Git Automation
-                println!("Deployment successful. Committing changes...");
+                println!("\n🚀 Deployment successful. Preparing to commit changes...");
                 let commit_msg = format!("deploy({}): update {} to {}", selected_env.name, selected_service.name, selected_tag);
-                if let Err(e) = Git::commit_and_push(&selected_env.repo_root, &commit_msg, &yaml_path) {
-                    println!("⚠️  Failed to commit/push changes: {}", e);
+                
+                println!("\n--- Commit Recap ---");
+                println!("File to commit:   {}", yaml_path.display());
+                println!("Commit message:   {}", commit_msg);
+                println!("--------------------\n");
+
+                if Confirm::new("Do you want to commit and push these changes?")
+                    .with_default(true)
+                    .prompt()? 
+                {
+                    if let Err(e) = Git::commit_and_push(&selected_env.env_yaml_dir, &commit_msg, &yaml_path) {
+                        println!("⚠️  Failed to commit/push changes: {}", e);
+                    } else {
+                        println!("✅ Changes committed and pushed to Git.");
+                    }
                 } else {
-                    println!("✅ Changes committed and pushed to Git.");
+                    println!("Committing skipped by user.");
                 }
         }
         Commands::Config { command } => match command {
@@ -207,7 +233,7 @@ fn resolve_service(env: &Environment, input: Option<String>) -> Result<ServiceSo
         .context("Failed to list services in repo_root")?;
     
     if services.is_empty() {
-        return Err(anyhow::anyhow!("No services found in {}", env.repo_root.display()));
+        return Err(anyhow::anyhow!("No services found in {}", env.env_yaml_dir.display()));
     }
 
     let service_name = match input {

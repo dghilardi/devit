@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Refactored `repo_root` to `env_yaml_dir` in configuration for better clarity.
+- Improved Git repository detection to correctly identify repositories when operating from subdirectories.
+- Integrated an automatic `git pull` as the first step of the deployment process, with a user prompt on failure.
+- Implemented a commit recap and confirmation prompt before pushing deployment changes to Git.
 - Initial project structure.
 - Requirements document (`docs/REQUIREMENTS.md`).
 - Project documentation: `README.md`, `CHANGELOG.md`, and `AGENT.md`.
