@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Integrated an automatic `git pull` as the first step of the deployment process, with a user prompt on failure.
 - Implemented a commit recap and confirmation prompt before pushing deployment changes to Git.
 - Added a `--dry-run` flag to the `deploy` command to preview actions without executing them.
+- Improved microservice disambiguation in selection menu (showing namespace and relative path for duplicates).
 - Initial project structure.
 - Requirements document (`docs/REQUIREMENTS.md`).
 - Project documentation: `README.md`, `CHANGELOG.md`, and `AGENT.md`.
