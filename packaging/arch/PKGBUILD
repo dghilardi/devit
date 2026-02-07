@@ -1,6 +1,6 @@
 # Maintainer: Davide Ghilardi <davide@ghilardi.io>
 pkgname=davit
-pkgver=r20.69c8bf0
+pkgver=r23.c11bbbc
 pkgrel=1
 pkgdesc="A safe Kubernetes deployment wrapper & TUI built with Rust"
 arch=('x86_64')

@@ -193,6 +193,7 @@ async fn main() -> Result<()> {
                 println!("\n--- Commit Recap ---");
                 println!("File to commit:   {}", yaml_path.display());
                 println!("Commit message:   {}", commit_msg);
+                Blueprint::show_diff(&original_content, &updated_content, filename, true);
                 println!("--------------------\n");
 
                 if Confirm::new("Do you want to commit and push these changes?")
