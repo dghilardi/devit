@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added Arch Linux AUR packaging files in `packaging/arch`.
 - Refactored `repo_root` to `env_yaml_dir` in configuration for better clarity.
 - Improved Git repository detection to correctly identify repositories when operating from subdirectories.
 - Integrated an automatic `git pull` as the first step of the deployment process, with a user prompt on failure.

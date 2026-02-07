@@ -1,0 +1,38 @@
+# Maintainer: Davide Ghilardi <davide@ghilardi.io>
+pkgname=davit
+pkgver=r20.69c8bf0
+pkgrel=1
+pkgdesc="A safe Kubernetes deployment wrapper & TUI built with Rust"
+arch=('x86_64')
+url="https://github.com/dghilardi/davit"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo' 'git')
+source=("${pkgname}::git+file://${startdir}/../../")
+sha256sums=('SKIP')
+options=('!lto')
+
+pkgver() {
+  cd "$srcdir/$pkgname"
+  printf "r%s.%s" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+  export CARGO_TARGET_DIR="$startdir/../../target"
+  cargo build --frozen --release --all-features
+}
+
+check() {
+  cd "$srcdir/$pkgname"
+  export CARGO_TARGET_DIR="$startdir/../../target"
+  cargo test --frozen
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+  install -Dm755 "$startdir/../../target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
+  if [ -f "LICENSE" ]; then
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  fi
+}
