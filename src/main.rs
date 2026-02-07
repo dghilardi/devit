@@ -39,6 +39,10 @@ enum Commands {
         /// Image tag to deploy
         #[arg(short, long)]
         tag: Option<String>,
+
+        /// Dry run: show commands without executing them
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Configuration management
     Config {
@@ -61,12 +65,12 @@ async fn main() -> Result<()> {
     let config = Config::load().context("Failed to load configuration")?;
 
     match cli.command {
-        Commands::Deploy { env, service, tag } => {
+        Commands::Deploy { env, service, tag, dry_run } => {
             let selected_env = resolve_environment(&config, env)?;
             
             // Phase 6.2 - Git Pull before deployment
             println!("🔄 Checking for updates in {}...", selected_env.env_yaml_dir.display());
-            if let Err(e) = Git::pull(&selected_env.env_yaml_dir) {
+            if let Err(e) = Git::pull(&selected_env.env_yaml_dir, dry_run) {
                 println!("⚠️  Git pull failed: {}", e);
                 if !Confirm::new("Do you want to continue with the deployment anyway?")
                     .with_default(false)
@@ -123,8 +127,12 @@ async fn main() -> Result<()> {
 
                 match selection {
                     "Apply" => {
-                        fs::write(&yaml_path, &updated_content)
-                            .with_context(|| format!("Failed to write updated YAML to {}", yaml_path.display()))?;
+                        if dry_run {
+                            println!("Dry-run: would write updated YAML to {}", yaml_path.display());
+                        } else {
+                            fs::write(&yaml_path, &updated_content)
+                                .with_context(|| format!("Failed to write updated YAML to {}", yaml_path.display()))?;
+                        }
                         println!("Local YAML updated. Executing kubectl apply...");
                         break;
                     }
@@ -137,10 +145,13 @@ async fn main() -> Result<()> {
                 }
             }
             
-            let output = Command::new("kubectl")
-                    .args(["--context", &selected_env.kubectl_context, "apply", "-f", yaml_path.to_str().unwrap()])
-                    .output()
-                    .context("Failed to execute kubectl apply")?;
+            if dry_run {
+                println!("Dry-run: kubectl --context {} apply -f {}", selected_env.kubectl_context, yaml_path.display());
+            } else {
+                let output = Command::new("kubectl")
+                        .args(["--context", &selected_env.kubectl_context, "apply", "-f", yaml_path.to_str().unwrap()])
+                        .output()
+                        .context("Failed to execute kubectl apply")?;
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -151,6 +162,7 @@ async fn main() -> Result<()> {
                     }
                     return Err(anyhow::anyhow!("kubectl apply failed"));
                 }
+            }
 
                 println!("Deployment applied. Starting dashboard...");
                 
@@ -187,10 +199,12 @@ async fn main() -> Result<()> {
                     .with_default(true)
                     .prompt()? 
                 {
-                    if let Err(e) = Git::commit_and_push(&selected_env.env_yaml_dir, &commit_msg, &yaml_path) {
+                    if let Err(e) = Git::commit_and_push(&selected_env.env_yaml_dir, &commit_msg, &yaml_path, dry_run) {
                         println!("⚠️  Failed to commit/push changes: {}", e);
                     } else {
-                        println!("✅ Changes committed and pushed to Git.");
+                        if !dry_run {
+                            println!("✅ Changes committed and pushed to Git.");
+                        }
                     }
                 } else {
                     println!("Committing skipped by user.");

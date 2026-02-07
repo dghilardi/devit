@@ -18,7 +18,12 @@ impl Git {
     }
 
     /// Performs a git pull.
-    pub fn pull(path: &Path) -> Result<()> {
+    pub fn pull(path: &Path, dry_run: bool) -> Result<()> {
+        if dry_run {
+            println!("Dry-run: git -C {} pull", path.display());
+            return Ok(());
+        }
+
         let status = Command::new("git")
             .arg("-C")
             .arg(path)
@@ -34,7 +39,14 @@ impl Git {
     }
 
     /// Adds, commits and pushes the change.
-    pub fn commit_and_push(path: &Path, message: &str, file: &Path) -> Result<()> {
+    pub fn commit_and_push(path: &Path, message: &str, file: &Path, dry_run: bool) -> Result<()> {
+        if dry_run {
+            println!("Dry-run: git -C {} add {}", path.display(), file.display());
+            println!("Dry-run: git -C {} commit -m \"{}\"", path.display(), message);
+            println!("Dry-run: git -C {} push", path.display());
+            return Ok(());
+        }
+
         if !Self::is_repo(path) {
             return Err(anyhow::anyhow!("Not inside a git repository: {}", path.display()));
         }
