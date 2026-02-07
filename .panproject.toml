@@ -1,0 +1,8 @@
+[vcs]
+software = "Git"
+tag_template = "{{version}}"
+
+[modules.main]
+path = "."
+packageManager = "Cargo"
+main = true

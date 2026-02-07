@@ -36,6 +36,12 @@ We follow a **Trunk-Based Development** model with short-lived **Feature Branche
     - Merge into `main` via Pull Requests.
     - Branches should be deleted immediately after merging.
 - **Commits:** Follow conventional commit messages (e.g., `feat: ...`, `fix: ...`, `docs: ...`).
+- **Releases:** Use `panrelease` to manage project versions and tags.
+    - `panrelease patch`: Bump patch version (0.1.0 -> 0.1.1).
+    - `panrelease minor`: Bump minor version (0.1.0 -> 0.2.0).
+    - `panrelease major`: Bump major version (0.1.0 -> 1.0.0).
+    - `panrelease <version>`: Set an explicit version.
+    - **Note:** `panrelease` will automatically update `Cargo.toml`, `CHANGELOG.md`, commit the changes, and create a Git tag.
 
 ## 📑 Required Documentation Updates
 
