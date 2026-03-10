@@ -48,6 +48,9 @@ struct LogLine {
 struct PodInfo {
     name: String,
     status: String,
+    ready: String,
+    restarts: i32,
+    age: String,
     is_new: bool,
 }
 
@@ -227,9 +230,32 @@ impl Dashboard {
                         });
                     }
 
+                    let container_statuses =
+                        p.status.as_ref().and_then(|s| s.container_statuses.as_ref());
+                    let total_containers = p
+                        .spec
+                        .as_ref()
+                        .map(|s| s.containers.len())
+                        .unwrap_or(0);
+                    let ready_count = container_statuses
+                        .map(|cs| cs.iter().filter(|c| c.ready).count())
+                        .unwrap_or(0);
+                    let restarts = container_statuses
+                        .map(|cs| cs.iter().map(|c| c.restart_count).sum())
+                        .unwrap_or(0);
+                    let age = p
+                        .metadata
+                        .creation_timestamp
+                        .as_ref()
+                        .map(|t| format_age(t.0))
+                        .unwrap_or_else(|| "-".to_string());
+
                     current_pods.push(PodInfo {
                         name,
                         status,
+                        ready: format!("{}/{}", ready_count, total_containers),
+                        restarts,
+                        age,
                         is_new,
                     });
                 }
@@ -310,8 +336,22 @@ impl Dashboard {
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
-                let prefix = if p.is_new { " [NEW] " } else { " [OLD] " };
-                ListItem::new(format!("{}{} -> {}", prefix, p.name, p.status)).style(style)
+                let prefix = if p.is_new { "NEW" } else { "OLD" };
+                let restarts_str = if p.restarts > 0 {
+                    format!("{}r", p.restarts)
+                } else {
+                    "0r".to_string()
+                };
+                ListItem::new(format!(
+                    " [{prefix}] {name:<48} {status:<12} {ready:<6} {restarts:<5} {age}",
+                    prefix = prefix,
+                    name = p.name,
+                    status = p.status,
+                    ready = p.ready,
+                    restarts = restarts_str,
+                    age = p.age,
+                ))
+                .style(style)
             })
             .collect();
 
@@ -367,5 +407,21 @@ impl Dashboard {
         } else {
             Style::default().fg(default_color)
         }
+    }
+}
+
+fn format_age(created: k8s_openapi::jiff::Timestamp) -> String {
+    let now = k8s_openapi::jiff::Timestamp::now();
+    let secs = (now - created).get_seconds();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else if secs < 3600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else {
+        let days = secs / 86400;
+        let hours = (secs % 86400) / 3600;
+        format!("{}d{}h", days, hours)
     }
 }
