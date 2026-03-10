@@ -14,6 +14,7 @@ In maritime terms, a **davit** is a crane-like device used to safely lower lifeb
     -   **Dashboard Mode:** Real-time rollout monitoring with split-screen logs (`ratatui`).
 -   **Visual Diffs:** Preview infrastructure YAML changes before applying them.
 -   **Automated Auditing:** Automatically commits and pushes changes to Git upon successful deployment.
+-   **Deployment Info:** Inspect deployed services with `davit info` - view workload status, current image version, last release commit, labels, pod details, resource usage, and recent events.
 
 ## 🚀 Getting Started
 
@@ -57,6 +58,12 @@ davit deploy
 
 # Direct deploy
 davit deploy --env staging --service auth-api --tag v1.2.3
+
+# Inspect a deployed service
+davit info --env staging --service auth-api
+
+# Filter by namespace
+davit info --env staging --namespace default --service auth-api
 ```
 
 ## 🛠 For Developers

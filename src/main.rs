@@ -1,20 +1,21 @@
-mod config;
-mod registry;
 mod blueprint;
+mod config;
 mod dashboard;
 mod git;
+mod info;
+mod registry;
 
-use clap::{Parser, Subcommand};
-use anyhow::{Result, Context};
-use config::{Config, Environment, ServiceSource};
-use registry::{Registry, ImageMetadata};
+use anyhow::{Context, Result};
 use blueprint::Blueprint;
+use chrono::Utc;
+use clap::{Parser, Subcommand};
+use config::{Config, Environment, ServiceSource};
 use dashboard::Dashboard;
 use git::Git;
-use inquire::{Select, Confirm, Text};
-use std::process::Command;
-use chrono::Utc;
+use inquire::{Confirm, Select, Text};
+use registry::{ImageMetadata, Registry};
 use std::fs;
+use std::process::Command;
 
 #[derive(Parser)]
 #[command(name = "davit")]
@@ -44,6 +45,20 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Show deployment information for a service
+    Info {
+        /// Target environment (e.g., staging, production)
+        #[arg(short, long)]
+        env: Option<String>,
+
+        /// Kubernetes namespace filter
+        #[arg(short, long)]
+        namespace: Option<String>,
+
+        /// Service name to inspect
+        #[arg(short, long)]
+        service: Option<String>,
+    },
     /// Configuration management
     Config {
         #[command(subcommand)]
@@ -65,23 +80,33 @@ async fn main() -> Result<()> {
     let config = Config::load().context("Failed to load configuration")?;
 
     match cli.command {
-        Commands::Deploy { env, service, tag, dry_run } => {
+        Commands::Deploy {
+            env,
+            service,
+            tag,
+            dry_run,
+        } => {
             let selected_env = resolve_environment(&config, env)?;
-            
+
             // Phase 6.2 - Git Pull before deployment
-            println!("🔄 Checking for updates in {}...", selected_env.env_yaml_dir.display());
+            println!(
+                "🔄 Checking for updates in {}...",
+                selected_env.env_yaml_dir.display()
+            );
             if let Err(e) = Git::pull(&selected_env.env_yaml_dir, dry_run) {
                 println!("⚠️  Git pull failed: {}", e);
                 if !Confirm::new("Do you want to continue with the deployment anyway?")
                     .with_default(false)
-                    .prompt()? 
+                    .prompt()?
                 {
-                    return Err(anyhow::anyhow!("Deployment aborted by user after git pull failure."));
+                    return Err(anyhow::anyhow!(
+                        "Deployment aborted by user after git pull failure."
+                    ));
                 }
             }
 
             let selected_service = resolve_service(&selected_env, service)?;
-            
+
             let selected_tag = if let Some(t) = tag {
                 t
             } else {
@@ -90,11 +115,17 @@ async fn main() -> Result<()> {
 
             // 6.3 Production Protection
             if selected_env.protected.unwrap_or(false) {
-                println!("⚠️  WARNING: Deployment to {} is PROTECTED!", selected_env.name);
-                let confirmation = Text::new(&format!("Type the environment name '{}' to confirm:", selected_env.name))
-                    .prompt()
-                    .context("Production confirmation was cancelled")?;
-                
+                println!(
+                    "⚠️  WARNING: Deployment to {} is PROTECTED!",
+                    selected_env.name
+                );
+                let confirmation = Text::new(&format!(
+                    "Type the environment name '{}' to confirm:",
+                    selected_env.name
+                ))
+                .prompt()
+                .context("Production confirmation was cancelled")?;
+
                 if confirmation != selected_env.name {
                     return Err(anyhow::anyhow!("Confirmation failed. Deployment aborted."));
                 }
@@ -102,17 +133,25 @@ async fn main() -> Result<()> {
 
             // Phase 4 - YAML modification & Visual Diff
             let yaml_path = selected_service.yaml_path.clone();
-            
+
             let original_content = fs::read_to_string(&yaml_path)
                 .with_context(|| format!("Failed to read YAML file at {}", yaml_path.display()))?;
-            
-            let base_image = selected_service.image_path.split([':', '@']).next().unwrap_or(&selected_service.image_path);
-            
-            let updated_content = Blueprint::update_image_tag(&original_content, base_image, &selected_tag)
-                .context("Failed to update image tag in YAML")?;
+
+            let base_image = selected_service
+                .image_path
+                .split([':', '@'])
+                .next()
+                .unwrap_or(&selected_service.image_path);
+
+            let updated_content =
+                Blueprint::update_image_tag(&original_content, base_image, &selected_tag)
+                    .context("Failed to update image tag in YAML")?;
 
             let mut show_unified = true;
-            let filename = yaml_path.file_name().and_then(|n| n.to_str()).unwrap_or("deployment.yaml");
+            let filename = yaml_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("deployment.yaml");
 
             loop {
                 Blueprint::show_diff(&original_content, &updated_content, filename, show_unified);
@@ -128,10 +167,14 @@ async fn main() -> Result<()> {
                 match selection {
                     "Apply" => {
                         if dry_run {
-                            println!("Dry-run: would write updated YAML to {}", yaml_path.display());
+                            println!(
+                                "Dry-run: would write updated YAML to {}",
+                                yaml_path.display()
+                            );
                         } else {
-                            fs::write(&yaml_path, &updated_content)
-                                .with_context(|| format!("Failed to write updated YAML to {}", yaml_path.display()))?;
+                            fs::write(&yaml_path, &updated_content).with_context(|| {
+                                format!("Failed to write updated YAML to {}", yaml_path.display())
+                            })?;
                         }
                         println!("Local YAML updated. Executing kubectl apply...");
                         break;
@@ -144,19 +187,32 @@ async fn main() -> Result<()> {
                     }
                 }
             }
-            
+
             if dry_run {
-                println!("Dry-run: kubectl --context {} apply -f {}", selected_env.kubectl_context, yaml_path.display());
+                println!(
+                    "Dry-run: kubectl --context {} apply -f {}",
+                    selected_env.kubectl_context,
+                    yaml_path.display()
+                );
             } else {
                 let output = Command::new("kubectl")
-                        .args(["--context", &selected_env.kubectl_context, "apply", "-f", yaml_path.to_str().unwrap()])
-                        .output()
-                        .context("Failed to execute kubectl apply")?;
+                    .args([
+                        "--context",
+                        &selected_env.kubectl_context,
+                        "apply",
+                        "-f",
+                        yaml_path.to_str().unwrap(),
+                    ])
+                    .output()
+                    .context("Failed to execute kubectl apply")?;
 
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     println!("❌ kubectl apply failed: {}", stderr);
-                    if Confirm::new("Revert local YAML changes?").with_default(true).prompt()? {
+                    if Confirm::new("Revert local YAML changes?")
+                        .with_default(true)
+                        .prompt()?
+                    {
                         fs::write(&yaml_path, &original_content)?;
                         println!("YAML reverted.");
                     }
@@ -164,52 +220,73 @@ async fn main() -> Result<()> {
                 }
             }
 
-                println!("Deployment applied. Starting dashboard...");
-                
-                let mut dashboard = Dashboard::new(
-                    selected_service.name.clone(),
-                    selected_env.name.clone(),
-                    selected_tag.clone(),
-                    selected_env.kubectl_context.clone(),
-                    selected_service.namespace.clone(),
-                    selected_service.selector.clone(),
-                    selected_service.container_name.clone(),
-                );
-                let res = dashboard.run().await;
+            println!("Deployment applied. Starting dashboard...");
 
-                if let Err(e) = res {
-                    println!("❌ Dashboard error or aborted: {}", e);
-                    if Confirm::new("Revert local YAML changes?").with_default(true).prompt()? {
-                        fs::write(&yaml_path, &original_content)?;
-                        println!("YAML reverted.");
-                    }
-                    return Err(e);
-                }
+            let mut dashboard = Dashboard::new(
+                selected_service.name.clone(),
+                selected_env.name.clone(),
+                selected_tag.clone(),
+                selected_env.kubectl_context.clone(),
+                selected_service.namespace.clone(),
+                selected_service.selector.clone(),
+                selected_service.container_name.clone(),
+            );
+            let res = dashboard.run().await;
 
-                // 6.1 Git Automation
-                println!("\n🚀 Deployment successful. Preparing to commit changes...");
-                let commit_msg = format!("deploy({}): update {} to {}", selected_env.name, selected_service.name, selected_tag);
-                
-                println!("\n--- Commit Recap ---");
-                println!("File to commit:   {}", yaml_path.display());
-                println!("Commit message:   {}", commit_msg);
-                Blueprint::show_diff(&original_content, &updated_content, filename, true);
-                println!("--------------------\n");
-
-                if Confirm::new("Do you want to commit and push these changes?")
+            if let Err(e) = res {
+                println!("❌ Dashboard error or aborted: {}", e);
+                if Confirm::new("Revert local YAML changes?")
                     .with_default(true)
-                    .prompt()? 
+                    .prompt()?
                 {
-                    if let Err(e) = Git::commit_and_push(&selected_env.env_yaml_dir, &commit_msg, &yaml_path, dry_run) {
-                        println!("⚠️  Failed to commit/push changes: {}", e);
-                    } else {
-                        if !dry_run {
-                            println!("✅ Changes committed and pushed to Git.");
-                        }
-                    }
-                } else {
-                    println!("Committing skipped by user.");
+                    fs::write(&yaml_path, &original_content)?;
+                    println!("YAML reverted.");
                 }
+                return Err(e);
+            }
+
+            // 6.1 Git Automation
+            println!("\n🚀 Deployment successful. Preparing to commit changes...");
+            let commit_msg = format!(
+                "deploy({}): update {} to {}",
+                selected_env.name, selected_service.name, selected_tag
+            );
+
+            println!("\n--- Commit Recap ---");
+            println!("File to commit:   {}", yaml_path.display());
+            println!("Commit message:   {}", commit_msg);
+            Blueprint::show_diff(&original_content, &updated_content, filename, true);
+            println!("--------------------\n");
+
+            if Confirm::new("Do you want to commit and push these changes?")
+                .with_default(true)
+                .prompt()?
+            {
+                if let Err(e) = Git::commit_and_push(
+                    &selected_env.env_yaml_dir,
+                    &commit_msg,
+                    &yaml_path,
+                    dry_run,
+                ) {
+                    println!("⚠️  Failed to commit/push changes: {}", e);
+                } else {
+                    if !dry_run {
+                        println!("✅ Changes committed and pushed to Git.");
+                    }
+                }
+            } else {
+                println!("Committing skipped by user.");
+            }
+        }
+        Commands::Info {
+            env,
+            namespace,
+            service,
+        } => {
+            let selected_env = resolve_environment(&config, env)?;
+            let selected_service =
+                resolve_service_with_ns_filter(&selected_env, service, namespace)?;
+            info::show_info(&selected_env, &selected_service).await?;
         }
         Commands::Config { command } => match command {
             ConfigCommands::Show => {
@@ -227,25 +304,29 @@ async fn main() -> Result<()> {
 
 fn resolve_environment(config: &Config, input: Option<String>) -> Result<Environment> {
     let env_names: Vec<String> = config.environments.iter().map(|e| e.name.clone()).collect();
-    
+
     let name = match input {
         Some(val) => resolve_from_list("Environment", &env_names, val)?,
-        None => {
-            Select::new("Select Environment:", env_names.clone())
-                .prompt()
-                .context("Environment selection was cancelled")?
-        }
+        None => Select::new("Select Environment:", env_names.clone())
+            .prompt()
+            .context("Environment selection was cancelled")?,
     };
 
-    config.environments.iter()
+    config
+        .environments
+        .iter()
         .find(|e| e.name == name)
         .cloned()
         .context("Environment not found in config")
 }
 
-
-fn get_service_display_name(s: &ServiceSource, all_services: &[ServiceSource], env_yaml_dir: &std::path::Path) -> String {
-    let duplicates: Vec<&ServiceSource> = all_services.iter()
+fn get_service_display_name(
+    s: &ServiceSource,
+    all_services: &[ServiceSource],
+    env_yaml_dir: &std::path::Path,
+) -> String {
+    let duplicates: Vec<&ServiceSource> = all_services
+        .iter()
         .filter(|&other| other.name == s.name)
         .collect();
 
@@ -254,52 +335,96 @@ fn get_service_display_name(s: &ServiceSource, all_services: &[ServiceSource], e
     }
 
     // Multiple services with same name, check namespace
-    let same_namespace: Vec<&&ServiceSource> = duplicates.iter()
+    let same_namespace: Vec<&&ServiceSource> = duplicates
+        .iter()
         .filter(|&other| other.namespace == s.namespace)
         .collect();
 
     if same_namespace.len() <= 1 {
-        return format!("{} ({})", s.name, s.namespace.as_deref().unwrap_or("no-namespace"));
+        return format!(
+            "{} ({})",
+            s.name,
+            s.namespace.as_deref().unwrap_or("no-namespace")
+        );
     }
 
     // Multiple services with same name and same namespace, use relative path
-    let relative_path = pathdiff::diff_paths(&s.yaml_path, env_yaml_dir)
-        .unwrap_or_else(|| s.yaml_path.clone());
-    
-    format!("{} ({}) [{}]", 
-        s.name, 
+    let relative_path =
+        pathdiff::diff_paths(&s.yaml_path, env_yaml_dir).unwrap_or_else(|| s.yaml_path.clone());
+
+    format!(
+        "{} ({}) [{}]",
+        s.name,
         s.namespace.as_deref().unwrap_or("no-namespace"),
         relative_path.display()
     )
 }
 
 fn resolve_service(env: &Environment, input: Option<String>) -> Result<ServiceSource> {
-    let services = env.list_services()
+    let services = env
+        .list_services()
         .context("Failed to list services in repo_root")?;
-    
+    resolve_service_from_list(services, env, input)
+}
+
+fn resolve_service_with_ns_filter(
+    env: &Environment,
+    input: Option<String>,
+    namespace: Option<String>,
+) -> Result<ServiceSource> {
+    let all_services = env.list_services().context("Failed to list services")?;
+
+    let services = match namespace {
+        Some(ref ns) => {
+            let filtered: Vec<ServiceSource> = all_services
+                .into_iter()
+                .filter(|s| s.namespace.as_deref() == Some(ns.as_str()))
+                .collect();
+            if filtered.is_empty() {
+                return Err(anyhow::anyhow!("No services found in namespace '{}'", ns));
+            }
+            filtered
+        }
+        None => all_services,
+    };
+
+    resolve_service_from_list(services, env, input)
+}
+
+fn resolve_service_from_list(
+    services: Vec<ServiceSource>,
+    env: &Environment,
+    input: Option<String>,
+) -> Result<ServiceSource> {
     if services.is_empty() {
-        return Err(anyhow::anyhow!("No services found in {}", env.env_yaml_dir.display()));
+        return Err(anyhow::anyhow!(
+            "No services found in {}",
+            env.env_yaml_dir.display()
+        ));
     }
 
-    let service_map: Vec<(String, ServiceSource)> = services.iter()
+    let service_map: Vec<(String, ServiceSource)> = services
+        .iter()
         .cloned()
-        .map(|s| (get_service_display_name(&s, &services, &env.env_yaml_dir), s))
+        .map(|s| {
+            (
+                get_service_display_name(&s, &services, &env.env_yaml_dir),
+                s,
+            )
+        })
         .collect();
 
     let display_names: Vec<String> = service_map.iter().map(|(n, _)| n.clone()).collect();
 
     let selected_name = match input {
-        Some(val) => {
-            resolve_from_list("Service", &display_names, val)?
-        }
-        None => {
-            Select::new("Select Service:", display_names.clone())
-                .prompt()
-                .context("Service selection was cancelled")?
-        }
+        Some(val) => resolve_from_list("Service", &display_names, val)?,
+        None => Select::new("Select Service:", display_names.clone())
+            .prompt()
+            .context("Service selection was cancelled")?,
     };
 
-    service_map.into_iter()
+    service_map
+        .into_iter()
         .find(|(n, _)| n == &selected_name)
         .map(|(_, s)| s)
         .context("Resolved service not found in list")
@@ -308,8 +433,11 @@ fn resolve_service(env: &Environment, input: Option<String>) -> Result<ServiceSo
 fn resolve_tag(env: &Environment, service: &ServiceSource) -> Result<String> {
     let project = env.gcp_project.as_deref().unwrap_or("MOCK_PROJECT");
 
-    println!("Fetching images for {} using path {}...", service.name, service.image_path);
-    
+    println!(
+        "Fetching images for {} using path {}...",
+        service.name, service.image_path
+    );
+
     let images = match Registry::fetch_images(&service.image_path) {
         Ok(imgs) => imgs,
         Err(e) => {
@@ -322,15 +450,21 @@ fn resolve_tag(env: &Environment, service: &ServiceSource) -> Result<String> {
     };
 
     if images.is_empty() {
-        return Err(anyhow::anyhow!("No images found for service {}", service.name));
+        return Err(anyhow::anyhow!(
+            "No images found for service {}",
+            service.name
+        ));
     }
 
-    let options: Vec<String> = images.iter()
+    let options: Vec<String> = images
+        .iter()
         .map(|img| {
-            format!("{:<15} ({}) [{}]", 
-                img.display_tag(), 
-                img.age_string(), 
-                img.short_hash())
+            format!(
+                "{:<15} ({}) [{}]",
+                img.display_tag(),
+                img.age_string(),
+                img.short_hash()
+            )
         })
         .collect();
 
@@ -338,7 +472,8 @@ fn resolve_tag(env: &Environment, service: &ServiceSource) -> Result<String> {
         .prompt()
         .context("Image selection was cancelled")?;
 
-    let tag = selection.split_whitespace()
+    let tag = selection
+        .split_whitespace()
         .next()
         .unwrap_or("")
         .trim_end_matches(',')
@@ -376,9 +511,7 @@ fn resolve_from_list(label: &str, items: &[String], input: String) -> Result<Str
     }
 
     // 2. Partial matches
-    let matches: Vec<&String> = items.iter()
-        .filter(|&i| i.contains(&input))
-        .collect();
+    let matches: Vec<&String> = items.iter().filter(|&i| i.contains(&input)).collect();
 
     match matches.len() {
         0 => {
@@ -391,7 +524,7 @@ fn resolve_from_list(label: &str, items: &[String], input: String) -> Result<Str
             let suggest = matches[0];
             if Confirm::new(&format!("Did you mean '{}'?", suggest))
                 .with_default(true)
-                .prompt()? 
+                .prompt()?
             {
                 Ok(suggest.clone())
             } else {
@@ -400,12 +533,16 @@ fn resolve_from_list(label: &str, items: &[String], input: String) -> Result<Str
                     .context(format!("{} selection was cancelled", label))
             }
         }
-        _ => {
-            Select::new(&format!("Multiple matches for '{}'. Select {}:", input, label.to_lowercase()), 
-                        matches.into_iter().cloned().collect())
-                .prompt()
-                .context(format!("{} selection was cancelled", label))
-        }
+        _ => Select::new(
+            &format!(
+                "Multiple matches for '{}'. Select {}:",
+                input,
+                label.to_lowercase()
+            ),
+            matches.into_iter().cloned().collect(),
+        )
+        .prompt()
+        .context(format!("{} selection was cancelled", label)),
     }
 }
 
@@ -418,6 +555,7 @@ mod tests {
     fn test_service_display_name_unique() {
         let s = ServiceSource {
             name: "service1".to_string(),
+            kind: "Deployment".to_string(),
             image_path: "img1".to_string(),
             container_name: "c1".to_string(),
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
@@ -433,6 +571,7 @@ mod tests {
     fn test_service_display_name_duplicate_name() {
         let s1 = ServiceSource {
             name: "service1".to_string(),
+            kind: "Deployment".to_string(),
             image_path: "img1".to_string(),
             container_name: "c1".to_string(),
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
@@ -441,6 +580,7 @@ mod tests {
         };
         let s2 = ServiceSource {
             name: "service1".to_string(),
+            kind: "Deployment".to_string(),
             image_path: "img2".to_string(),
             container_name: "c2".to_string(),
             yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
@@ -457,6 +597,7 @@ mod tests {
     fn test_service_display_name_duplicate_name_and_ns() {
         let s1 = ServiceSource {
             name: "service1".to_string(),
+            kind: "Deployment".to_string(),
             image_path: "img1".to_string(),
             container_name: "c1".to_string(),
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
@@ -465,6 +606,7 @@ mod tests {
         };
         let s2 = ServiceSource {
             name: "service1".to_string(),
+            kind: "Deployment".to_string(),
             image_path: "img2".to_string(),
             container_name: "c2".to_string(),
             yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
@@ -473,7 +615,13 @@ mod tests {
         };
         let all = vec![s1.clone(), s2.clone()];
         let root = PathBuf::from("/root");
-        assert_eq!(get_service_display_name(&s1, &all, &root), "service1 (ns1) [dir1/deploy.yaml]");
-        assert_eq!(get_service_display_name(&s2, &all, &root), "service1 (ns1) [dir2/deploy.yaml]");
+        assert_eq!(
+            get_service_display_name(&s1, &all, &root),
+            "service1 (ns1) [dir1/deploy.yaml]"
+        );
+        assert_eq!(
+            get_service_display_name(&s2, &all, &root),
+            "service1 (ns1) [dir2/deploy.yaml]"
+        );
     }
 }

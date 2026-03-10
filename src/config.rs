@@ -1,9 +1,9 @@
-use serde::Deserialize;
-use std::path::PathBuf;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use directories::ProjectDirs;
-use std::fs;
+use serde::Deserialize;
 use std::collections::HashSet;
+use std::fs;
+use std::path::PathBuf;
 use walkdir::WalkDir;
 
 #[derive(Debug, Deserialize)]
@@ -31,6 +31,7 @@ pub struct Environment {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ServiceSource {
     pub name: String,
+    pub kind: String,
     pub image_path: String,
     pub container_name: String,
     pub yaml_path: std::path::PathBuf,
@@ -51,7 +52,10 @@ impl Environment {
                 if e.depth() == 0 {
                     return true;
                 }
-                !e.file_name().to_str().map(|s| s.starts_with('.')).unwrap_or(false)
+                !e.file_name()
+                    .to_str()
+                    .map(|s| s.starts_with('.'))
+                    .unwrap_or(false)
             })
             .filter_map(|e| e.ok())
         {
@@ -64,7 +68,9 @@ impl Environment {
                             for document in deserializer {
                                 match serde_yaml::Value::deserialize(document) {
                                     Ok(resource) => {
-                                        if let Some(source) = self.extract_gcr_service(&resource, path) {
+                                        if let Some(source) =
+                                            self.extract_gcr_service(&resource, path)
+                                        {
                                             services.insert(source);
                                         }
                                     }
@@ -73,7 +79,10 @@ impl Environment {
                                         // Ignore "deserializing from YAML containing more than one document" if we are already using Deserializer
                                         // But if it's another error, log it.
                                         if !err_msg.contains("more than one document") {
-                                            eprintln!("Failed to parse YAML doc in {:?}: {}", path, e);
+                                            eprintln!(
+                                                "Failed to parse YAML doc in {:?}: {}",
+                                                path, e
+                                            );
                                         }
                                     }
                                 }
@@ -89,7 +98,11 @@ impl Environment {
         Ok(sorted_services)
     }
 
-    fn extract_gcr_service(&self, resource: &serde_yaml::Value, yaml_path: &std::path::Path) -> Option<ServiceSource> {
+    fn extract_gcr_service(
+        &self,
+        resource: &serde_yaml::Value,
+        yaml_path: &std::path::Path,
+    ) -> Option<ServiceSource> {
         let kind = resource.get("kind")?.as_str()?;
         let metadata = resource.get("metadata")?;
         let name = metadata.get("name")?.as_str()?;
@@ -102,9 +115,12 @@ impl Environment {
         // Search for images in the spec
         if let Some(spec) = resource.get("spec") {
             if let Some((image_path, container_name)) = self.find_gcr_image(spec) {
-                let namespace = metadata.get("namespace").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let namespace = metadata
+                    .get("namespace")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let mut selector = None;
-                
+
                 // Extract app label selector
                 if let Some(sel) = spec.get("selector") {
                     if let Some(match_labels) = sel.get("matchLabels") {
@@ -118,6 +134,7 @@ impl Environment {
 
                 return Some(ServiceSource {
                     name: name.to_string(),
+                    kind: kind.to_string(),
                     image_path,
                     container_name,
                     yaml_path: yaml_path.to_path_buf(),
@@ -136,7 +153,8 @@ impl Environment {
             if let Some(image_val) = map.get(&serde_yaml::Value::String("image".to_string())) {
                 if let Some(img_str) = image_val.as_str() {
                     if img_str.contains("gcr.io") || img_str.contains("pkg.dev") {
-                        let container_name = map.get(&serde_yaml::Value::String("name".to_string()))
+                        let container_name = map
+                            .get(&serde_yaml::Value::String("name".to_string()))
                             .and_then(|v| v.as_str())
                             .unwrap_or("default")
                             .to_string();
@@ -167,7 +185,7 @@ impl Environment {
 impl Config {
     pub fn load() -> Result<Self> {
         let config_path = Self::get_config_path()?;
-        
+
         if !config_path.exists() {
             return Err(anyhow::anyhow!(
                 "Config file not found at {}. Please create it based on documentation.",
@@ -177,7 +195,7 @@ impl Config {
 
         let content = fs::read_to_string(&config_path)
             .with_context(|| format!("Failed to read config file at {}", config_path.display()))?;
-        
+
         let config: Config = toml::from_str(&content)
             .with_context(|| format!("Failed to parse TOML config at {}", config_path.display()))?;
 
@@ -191,10 +209,10 @@ impl Config {
 
         let proj_dirs = ProjectDirs::from("com", "davit", "davit")
             .context("Could not determine project directories")?;
-        
+
         let mut config_path = proj_dirs.config_dir().to_path_buf();
         config_path.push("config.toml");
-        
+
         Ok(config_path)
     }
 }
@@ -213,7 +231,9 @@ mod tests {
         // 1. Valid Deployment with GCR image
         let service1_dir = env_yaml_dir.join("service1");
         fs::create_dir(&service1_dir)?;
-        fs::write(service1_dir.join("deploy.yaml"), r#"
+        fs::write(
+            service1_dir.join("deploy.yaml"),
+            r#"
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -231,12 +251,15 @@ spec:
       containers:
       - name: gcr-container
         image: gcr.io/my-project/my-image:latest
-"#)?;
+"#,
+        )?;
 
         // 2. Valid StatefulSet with Artifact Registry image
         let service2_dir = env_yaml_dir.join("service2");
         fs::create_dir(&service2_dir)?;
-        fs::write(service2_dir.join("statefulset.yaml"), r#"
+        fs::write(
+            service2_dir.join("statefulset.yaml"),
+            r#"
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -247,10 +270,13 @@ spec:
       containers:
       - name: main
         image: europe-west1-docker.pkg.dev/my-project/my-repo/my-image:v1
-"#)?;
+"#,
+        )?;
 
         // 3. Invalid Kind (Service)
-        fs::write(env_yaml_dir.join("service.yaml"), r#"
+        fs::write(
+            env_yaml_dir.join("service.yaml"),
+            r#"
 apiVersion: v1
 kind: Service
 metadata:
@@ -258,12 +284,15 @@ metadata:
 spec:
   ports:
   - port: 80
-"#)?;
+"#,
+        )?;
 
         // 4. Invalid Image (Docker Hub)
         let service3_dir = env_yaml_dir.join("service3");
         fs::create_dir(&service3_dir)?;
-        fs::write(service3_dir.join("deploy.yaml"), r#"
+        fs::write(
+            service3_dir.join("deploy.yaml"),
+            r#"
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -274,7 +303,8 @@ spec:
       containers:
       - name: main
         image: nginx:latest
-"#)?;
+"#,
+        )?;
 
         let env = Environment {
             name: "test".to_string(),
@@ -288,17 +318,37 @@ spec:
 
         let services = env.list_services()?;
         assert_eq!(services.len(), 2);
-        
+
         let gcr_service = services.iter().find(|s| s.name == "gcr-service").unwrap();
+        assert_eq!(gcr_service.kind, "Deployment");
         assert_eq!(gcr_service.image_path, "gcr.io/my-project/my-image:latest");
         assert_eq!(gcr_service.container_name, "gcr-container");
-        assert!(gcr_service.yaml_path.to_str().unwrap().contains("deploy.yaml"));
-        assert_eq!(gcr_service.selector, Some("app=gcr-service-app".to_string()));
+        assert!(
+            gcr_service
+                .yaml_path
+                .to_str()
+                .unwrap()
+                .contains("deploy.yaml")
+        );
+        assert_eq!(
+            gcr_service.selector,
+            Some("app=gcr-service-app".to_string())
+        );
         assert_eq!(gcr_service.namespace, Some("test-ns".to_string()));
 
         let pkg_service = services.iter().find(|s| s.name == "pkg-service").unwrap();
-        assert_eq!(pkg_service.image_path, "europe-west1-docker.pkg.dev/my-project/my-repo/my-image:v1");
-        assert!(pkg_service.yaml_path.to_str().unwrap().contains("statefulset.yaml"));
+        assert_eq!(pkg_service.kind, "StatefulSet");
+        assert_eq!(
+            pkg_service.image_path,
+            "europe-west1-docker.pkg.dev/my-project/my-repo/my-image:v1"
+        );
+        assert!(
+            pkg_service
+                .yaml_path
+                .to_str()
+                .unwrap()
+                .contains("statefulset.yaml")
+        );
 
         assert!(!services.iter().any(|s| s.name == "not-a-microservice"));
         assert!(!services.iter().any(|s| s.name == "dockerhub-service"));

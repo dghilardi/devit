@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Added `davit info` command to inspect deployed services: shows workload status, current image, last release commit (from git), labels/annotations, pod details, resources, and recent events.
+- Added `--namespace` flag to `info` command for filtering services by Kubernetes namespace.
+- Added `kind` field to `ServiceSource` for workload-type-aware K8s API queries.
+- Added `Git::last_commit_for_file()` to retrieve the last commit that modified a specific file.
 - Added Arch Linux AUR packaging files in `packaging/arch`.
 - Refactored `repo_root` to `env_yaml_dir` in configuration for better clarity.
 - Improved Git repository detection to correctly identify repositories when operating from subdirectories.
