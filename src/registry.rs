@@ -144,6 +144,7 @@ impl Registry {
                     "images",
                     "list",
                     base_image,
+                    "--include-tags",
                     "--format=json",
                     "--sort-by=~updateTime",
                 ])
