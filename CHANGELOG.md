@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] 2026-03-26
+
 ### Added
 - Added `davit info` command to inspect deployed services: shows workload status, current image, last release commit (from git), labels/annotations, pod details, resources, and recent events.
 - Added `--namespace` flag to `info` command for filtering services by Kubernetes namespace.
