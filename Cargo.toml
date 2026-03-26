@@ -2,6 +2,13 @@
 name = "davit"
 version = "0.1.0"
 edition = "2024"
+description = "Kubernetes management utilities"
+license = "MIT"
+repository = "https://github.com/dghilardi/devit"
+homepage = "https://github.com/dghilardi/devit"
+keywords = ["kubernetes", "k8s", "cli", "deployment", "management"]
+categories = ["command-line-utilities", "development-tools"]
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0.101"
