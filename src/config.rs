@@ -8,13 +8,7 @@ use walkdir::WalkDir;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub defaults: Option<Defaults>,
     pub environments: Vec<Environment>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct Defaults {
-    pub interactive: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -23,8 +17,6 @@ pub struct Environment {
     pub env_yaml_dir: PathBuf,
     pub kubectl_context: String,
     pub gcp_project: Option<String>,
-    pub gcp_location: Option<String>,
-    pub gcp_repository: Option<String>,
     pub protected: Option<bool>,
 }
 
@@ -311,8 +303,6 @@ spec:
             env_yaml_dir,
             kubectl_context: "test".to_string(),
             gcp_project: None,
-            gcp_location: None,
-            gcp_repository: None,
             protected: None,
         };
 
