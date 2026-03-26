@@ -13,7 +13,11 @@ pub struct ImageMetadata {
 
 impl ImageMetadata {
     pub fn display_tag(&self) -> String {
-        self.tags.join(", ")
+        if self.tags.is_empty() {
+            self.short_hash().to_string()
+        } else {
+            self.tags.join(", ")
+        }
     }
 
     pub fn short_hash(&self) -> String {
@@ -151,8 +155,38 @@ impl Registry {
                 return Err(anyhow::anyhow!("gcloud command failed: {}", stderr));
             }
 
-            let images: Vec<ImageMetadata> = serde_json::from_slice(&output.stdout)
+            let raw: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
                 .context("Failed to parse gcloud JSON output")?;
+
+            let images = raw
+                .into_iter()
+                .filter_map(|v| {
+                    let tags = v
+                        .get("tags")
+                        .and_then(|t| t.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| t.as_str().map(|s| s.to_string()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+
+                    let update_time: DateTime<Utc> = v
+                        .get("updateTime")?
+                        .as_str()?
+                        .parse()
+                        .ok()?;
+
+                    // name is nested under metadata.name
+                    let name = v
+                        .get("metadata")
+                        .and_then(|m| m.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(|s| s.to_string())?;
+
+                    Some(ImageMetadata { tags, update_time, name })
+                })
+                .collect();
 
             Ok(images)
         }
