@@ -77,6 +77,13 @@ struct ServiceInfo {
     pods: Vec<PodDetail>,
     last_commit: Option<GitCommitInfo>,
     events: Vec<EventInfo>,
+    image_comparison: ImageComparison,
+}
+
+struct ImageComparison {
+    yaml_image: String,
+    cluster_images: Vec<String>,
+    drift: bool,
 }
 
 pub async fn show_info(env: &Environment, service: &ServiceSource) -> Result<()> {
@@ -97,6 +104,7 @@ pub async fn show_info(env: &Environment, service: &ServiceSource) -> Result<()>
     let pods = fetch_pod_details(&client, ns, service).await?;
     let events = fetch_events(&client, ns, &service.name).await;
     let last_commit = fetch_git_info(env, service);
+    let image_comparison = build_image_comparison(service, &workload.running_images);
 
     let info = ServiceInfo {
         workload,
@@ -104,10 +112,56 @@ pub async fn show_info(env: &Environment, service: &ServiceSource) -> Result<()>
         pods,
         last_commit,
         events,
+        image_comparison,
     };
 
     print_info(&info, service, env);
     Ok(())
+}
+
+fn normalize_image_ref(image: &str) -> String {
+    image.trim().to_ascii_lowercase()
+}
+
+fn split_image_ref(image: &str) -> (&str, Option<&str>) {
+    let trimmed = image.trim();
+
+    if let Some((base, digest)) = trimmed.split_once('@') {
+        return (base, Some(digest));
+    }
+
+    if let Some((base, tag)) = trimmed.rsplit_once(':')
+        && !tag.contains('/')
+    {
+        return (base, Some(tag));
+    }
+
+    (trimmed, None)
+}
+
+fn same_image_ref(lhs: &str, rhs: &str) -> bool {
+    let (lhs_base, lhs_ver) = split_image_ref(lhs);
+    let (rhs_base, rhs_ver) = split_image_ref(rhs);
+
+    normalize_image_ref(lhs_base) == normalize_image_ref(rhs_base) && lhs_ver == rhs_ver
+}
+
+fn build_image_comparison(service: &ServiceSource, running_images: &[String]) -> ImageComparison {
+    let yaml_image = service.image_path.clone();
+    let cluster_images = running_images.to_vec();
+    let drift = if cluster_images.is_empty() {
+        false
+    } else {
+        !cluster_images
+            .iter()
+            .any(|cluster_img| same_image_ref(cluster_img, &yaml_image))
+    };
+
+    ImageComparison {
+        yaml_image,
+        cluster_images,
+        drift,
+    }
 }
 
 async fn fetch_workload_info(
@@ -659,6 +713,30 @@ fn print_info(info: &ServiceInfo, service: &ServiceSource, env: &Environment) {
     for img in &info.workload.running_images {
         let (base, tag) = img.rsplit_once(':').unwrap_or((img.as_str(), "(no tag)"));
         println!("  {}:{}", base, style(tag).cyan().bold());
+    }
+    println!();
+
+    // YAML vs Cluster Image Drift
+    println!("  {}", style("YAML VS CLUSTER").underlined().bold());
+    println!("  YAML:     {}", info.image_comparison.yaml_image);
+    if info.image_comparison.cluster_images.is_empty() {
+        println!("  Cluster:  {}", style("(no running image found)").yellow());
+    } else {
+        for (idx, img) in info.image_comparison.cluster_images.iter().enumerate() {
+            if idx == 0 {
+                println!("  Cluster:  {}", img);
+            } else {
+                println!("            {}", img);
+            }
+        }
+    }
+    if info.image_comparison.drift {
+        println!(
+            "  Status:   {}",
+            style("DIFF: cluster image does not match YAML").yellow().bold()
+        );
+    } else {
+        println!("  Status:   {}", style("OK: cluster and YAML are aligned").green());
     }
     println!();
 

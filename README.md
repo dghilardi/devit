@@ -14,7 +14,7 @@ In maritime terms, a **davit** is a crane-like device used to safely lower lifeb
     -   **Dashboard Mode:** Real-time rollout monitoring with split-screen logs (`ratatui`).
 -   **Visual Diffs:** Preview infrastructure YAML changes before applying them.
 -   **Automated Auditing:** Automatically commits and pushes changes to Git upon successful deployment.
--   **Deployment Info:** Inspect deployed services with `davit info` - view workload status, current image version, last release commit, labels, pod details, resource usage, and recent events.
+-   **Deployment Info:** Inspect deployed services with `davit info` - runs `git pull`, reads live workload state from cluster, and shows YAML vs cluster image drift together with workload status, current image version, last release commit, labels, pod details, resource usage, and recent events.
 
 ## 🚀 Getting Started
 

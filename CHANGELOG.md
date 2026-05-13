@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Updated `davit info` to run `git pull` before loading services and to show a YAML vs cluster image comparison, highlighting version drift when present.
+
 ## [0.1.3] 2026-03-26
 
 ## [0.1.2] 2026-03-26

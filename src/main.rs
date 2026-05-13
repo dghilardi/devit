@@ -284,6 +284,23 @@ async fn main() -> Result<()> {
             service,
         } => {
             let selected_env = resolve_environment(&config, env)?;
+
+            println!(
+                "🔄 Checking for updates in {}...",
+                selected_env.env_yaml_dir.display()
+            );
+            if let Err(e) = Git::pull(&selected_env.env_yaml_dir, false) {
+                println!("⚠️  Git pull failed: {}", e);
+                if !Confirm::new("Do you want to continue with info anyway?")
+                    .with_default(false)
+                    .prompt()?
+                {
+                    return Err(anyhow::anyhow!(
+                        "Info command aborted by user after git pull failure."
+                    ));
+                }
+            }
+
             let selected_service =
                 resolve_service_with_ns_filter(&selected_env, service, namespace)?;
             info::show_info(&selected_env, &selected_service).await?;
