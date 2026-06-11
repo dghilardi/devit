@@ -9,11 +9,12 @@ use anyhow::{Context, Result};
 use blueprint::Blueprint;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use config::{Config, Environment, ServiceSource};
+use config::{Config, Environment, ServiceSource, YamlSource};
 use dashboard::Dashboard;
 use git::Git;
 use inquire::{Confirm, Select, Text};
 use registry::{ImageMetadata, Registry};
+use std::collections::HashSet;
 use std::fs;
 use std::process::Command;
 
@@ -88,22 +89,7 @@ async fn main() -> Result<()> {
         } => {
             let selected_env = resolve_environment(&config, env)?;
 
-            // Phase 6.2 - Git Pull before deployment
-            println!(
-                "🔄 Checking for updates in {}...",
-                selected_env.env_yaml_dir.display()
-            );
-            if let Err(e) = Git::pull(&selected_env.env_yaml_dir, dry_run) {
-                println!("⚠️  Git pull failed: {}", e);
-                if !Confirm::new("Do you want to continue with the deployment anyway?")
-                    .with_default(false)
-                    .prompt()?
-                {
-                    return Err(anyhow::anyhow!(
-                        "Deployment aborted by user after git pull failure."
-                    ));
-                }
-            }
+            pull_yaml_sources(&selected_env, dry_run, "deployment")?;
 
             let selected_service = resolve_service(&selected_env, service)?;
 
@@ -263,7 +249,7 @@ async fn main() -> Result<()> {
                 .prompt()?
             {
                 if let Err(e) = Git::commit_and_push(
-                    &selected_env.env_yaml_dir,
+                    &selected_service.source_root,
                     &commit_msg,
                     &yaml_path,
                     dry_run,
@@ -285,21 +271,7 @@ async fn main() -> Result<()> {
         } => {
             let selected_env = resolve_environment(&config, env)?;
 
-            println!(
-                "🔄 Checking for updates in {}...",
-                selected_env.env_yaml_dir.display()
-            );
-            if let Err(e) = Git::pull(&selected_env.env_yaml_dir, false) {
-                println!("⚠️  Git pull failed: {}", e);
-                if !Confirm::new("Do you want to continue with info anyway?")
-                    .with_default(false)
-                    .prompt()?
-                {
-                    return Err(anyhow::anyhow!(
-                        "Info command aborted by user after git pull failure."
-                    ));
-                }
-            }
+            pull_yaml_sources(&selected_env, false, "info")?;
 
             let selected_service =
                 resolve_service_with_ns_filter(&selected_env, service, namespace)?;
@@ -340,7 +312,6 @@ fn resolve_environment(config: &Config, input: Option<String>) -> Result<Environ
 fn get_service_display_name(
     s: &ServiceSource,
     all_services: &[ServiceSource],
-    env_yaml_dir: &std::path::Path,
 ) -> String {
     let duplicates: Vec<&ServiceSource> = all_services
         .iter()
@@ -366,14 +337,13 @@ fn get_service_display_name(
     }
 
     // Multiple services with same name and same namespace, use relative path
-    let relative_path =
-        pathdiff::diff_paths(&s.yaml_path, env_yaml_dir).unwrap_or_else(|| s.yaml_path.clone());
+    let relative_path = get_service_source_display_path(s);
 
     format!(
-        "{} ({}) [{}]",
+        "{} ({}) {}",
         s.name,
         s.namespace.as_deref().unwrap_or("no-namespace"),
-        relative_path.display()
+        relative_path
     )
 }
 
@@ -415,20 +385,15 @@ fn resolve_service_from_list(
 ) -> Result<ServiceSource> {
     if services.is_empty() {
         return Err(anyhow::anyhow!(
-            "No services found in {}",
-            env.env_yaml_dir.display()
+            "No services found in configured YAML sources for {}",
+            env.name
         ));
     }
 
     let service_map: Vec<(String, ServiceSource)> = services
         .iter()
         .cloned()
-        .map(|s| {
-            (
-                get_service_display_name(&s, &services, &env.env_yaml_dir),
-                s,
-            )
-        })
+        .map(|s| (get_service_display_name(&s, &services), s))
         .collect();
 
     let display_names: Vec<String> = service_map.iter().map(|(n, _)| n.clone()).collect();
@@ -445,6 +410,76 @@ fn resolve_service_from_list(
         .find(|(n, _)| n == &selected_name)
         .map(|(_, s)| s)
         .context("Resolved service not found in list")
+}
+
+fn get_service_source_display_path(service: &ServiceSource) -> String {
+    let relative_path = pathdiff::diff_paths(&service.yaml_path, &service.source_root)
+        .unwrap_or_else(|| service.yaml_path.clone());
+    format!("[{}]/{}", service.source_name, relative_path.display())
+}
+
+fn pull_yaml_sources(env: &Environment, dry_run: bool, action: &str) -> Result<()> {
+    let sources = unique_yaml_sources(env);
+
+    if sources.is_empty() {
+        return Ok(());
+    }
+
+    println!("🔄 Checking for updates in configured YAML sources...");
+
+    let mut failures = Vec::new();
+    for source in sources {
+        println!("  - [{}] {}", source.name, source.root.display());
+        if let Err(e) = Git::pull(&source.root, dry_run) {
+            failures.push((source, e.to_string()));
+        }
+    }
+
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    println!("⚠️  Some YAML sources could not be updated:");
+    for (source, error) in &failures {
+        println!("  - [{}] {}: {}", source.name, source.root.display(), error);
+    }
+
+    if !Confirm::new(&format!("Do you want to continue with {} anyway?", action))
+        .with_default(false)
+        .prompt()?
+    {
+        return Err(anyhow::anyhow!(
+            "{} aborted by user after git pull failure.",
+            capitalize_action(action)
+        ));
+    }
+
+    Ok(())
+}
+
+fn unique_yaml_sources(env: &Environment) -> Vec<YamlSource> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+
+    for source in env.yaml_sources() {
+        let key = source
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| source.root.clone());
+        if seen.insert(key) {
+            unique.push(source);
+        }
+    }
+
+    unique
+}
+
+fn capitalize_action(action: &str) -> String {
+    let mut chars = action.chars();
+    match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    }
 }
 
 fn resolve_tag(env: &Environment, service: &ServiceSource) -> Result<String> {
@@ -575,13 +610,14 @@ mod tests {
             kind: "Deployment".to_string(),
             image_path: "img1".to_string(),
             container_name: "c1".to_string(),
+            source_name: "main".to_string(),
+            source_root: PathBuf::from("/root"),
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
         };
         let all = vec![s.clone()];
-        let root = PathBuf::from("/root");
-        assert_eq!(get_service_display_name(&s, &all, &root), "service1");
+        assert_eq!(get_service_display_name(&s, &all), "service1");
     }
 
     #[test]
@@ -591,6 +627,8 @@ mod tests {
             kind: "Deployment".to_string(),
             image_path: "img1".to_string(),
             container_name: "c1".to_string(),
+            source_name: "main".to_string(),
+            source_root: PathBuf::from("/root"),
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
@@ -600,14 +638,15 @@ mod tests {
             kind: "Deployment".to_string(),
             image_path: "img2".to_string(),
             container_name: "c2".to_string(),
+            source_name: "main".to_string(),
+            source_root: PathBuf::from("/root"),
             yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
             namespace: Some("ns2".to_string()),
             selector: None,
         };
         let all = vec![s1.clone(), s2.clone()];
-        let root = PathBuf::from("/root");
-        assert_eq!(get_service_display_name(&s1, &all, &root), "service1 (ns1)");
-        assert_eq!(get_service_display_name(&s2, &all, &root), "service1 (ns2)");
+        assert_eq!(get_service_display_name(&s1, &all), "service1 (ns1)");
+        assert_eq!(get_service_display_name(&s2, &all), "service1 (ns2)");
     }
 
     #[test]
@@ -617,6 +656,8 @@ mod tests {
             kind: "Deployment".to_string(),
             image_path: "img1".to_string(),
             container_name: "c1".to_string(),
+            source_name: "main".to_string(),
+            source_root: PathBuf::from("/root"),
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
@@ -626,19 +667,20 @@ mod tests {
             kind: "Deployment".to_string(),
             image_path: "img2".to_string(),
             container_name: "c2".to_string(),
+            source_name: "demo".to_string(),
+            source_root: PathBuf::from("/root"),
             yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
         };
         let all = vec![s1.clone(), s2.clone()];
-        let root = PathBuf::from("/root");
         assert_eq!(
-            get_service_display_name(&s1, &all, &root),
-            "service1 (ns1) [dir1/deploy.yaml]"
+            get_service_display_name(&s1, &all),
+            "service1 (ns1) [main]/dir1/deploy.yaml"
         );
         assert_eq!(
-            get_service_display_name(&s2, &all, &root),
-            "service1 (ns1) [dir2/deploy.yaml]"
+            get_service_display_name(&s2, &all),
+            "service1 (ns1) [demo]/dir2/deploy.yaml"
         );
     }
 }

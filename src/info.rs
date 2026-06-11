@@ -103,7 +103,7 @@ pub async fn show_info(env: &Environment, service: &ServiceSource) -> Result<()>
     let workload = fetch_workload_info(&client, ns, service).await?;
     let pods = fetch_pod_details(&client, ns, service).await?;
     let events = fetch_events(&client, ns, &service.name).await;
-    let last_commit = fetch_git_info(env, service);
+    let last_commit = fetch_git_info(service);
     let image_comparison = build_image_comparison(service, &workload.running_images);
 
     let info = ServiceInfo {
@@ -603,8 +603,8 @@ async fn fetch_events(client: &Client, namespace: &str, workload_name: &str) -> 
     events
 }
 
-fn fetch_git_info(env: &Environment, service: &ServiceSource) -> Option<GitCommitInfo> {
-    match Git::last_commit_for_file(&env.env_yaml_dir, &service.yaml_path) {
+fn fetch_git_info(service: &ServiceSource) -> Option<GitCommitInfo> {
+    match Git::last_commit_for_file(&service.source_root, &service.yaml_path) {
         Ok(Some(entry)) => {
             let short_hash = if entry.hash.len() >= 8 {
                 entry.hash[..8].to_string()
@@ -648,13 +648,14 @@ fn print_info(info: &ServiceInfo, service: &ServiceSource, env: &Environment) {
         .bold()
     );
 
-    let relative_yaml = pathdiff::diff_paths(&service.yaml_path, &env.env_yaml_dir)
+    let relative_yaml = pathdiff::diff_paths(&service.yaml_path, &service.source_root)
         .unwrap_or_else(|| service.yaml_path.clone());
     println!(
         "  {}",
         style(format!(
-            "Kind: {}  |  YAML: {}",
+            "Kind: {}  |  YAML: [{}]/{}",
             info.workload.kind,
+            service.source_name,
             relative_yaml.display()
         ))
         .dim()

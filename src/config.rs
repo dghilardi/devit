@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 #[derive(Debug, Deserialize)]
@@ -15,9 +15,17 @@ pub struct Config {
 pub struct Environment {
     pub name: String,
     pub env_yaml_dir: PathBuf,
+    #[serde(default)]
+    pub env_yaml_dir_extra: BTreeMap<String, PathBuf>,
     pub kubectl_context: String,
     pub gcp_project: Option<String>,
     pub protected: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct YamlSource {
+    pub name: String,
+    pub root: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -26,55 +34,72 @@ pub struct ServiceSource {
     pub kind: String,
     pub image_path: String,
     pub container_name: String,
+    pub source_name: String,
+    pub source_root: std::path::PathBuf,
     pub yaml_path: std::path::PathBuf,
     pub namespace: Option<String>,
     pub selector: Option<String>,
 }
 
 impl Environment {
+    pub fn yaml_sources(&self) -> Vec<YamlSource> {
+        let mut sources = vec![YamlSource {
+            name: "main".to_string(),
+            root: self.env_yaml_dir.clone(),
+        }];
+
+        sources.extend(self.env_yaml_dir_extra.iter().map(|(name, root)| YamlSource {
+            name: name.clone(),
+            root: root.clone(),
+        }));
+
+        sources
+    }
+
     pub fn list_services(&self) -> Result<Vec<ServiceSource>> {
         let mut services = HashSet::new();
-        if !self.env_yaml_dir.exists() {
-            return Ok(Vec::new());
-        }
 
-        for entry in WalkDir::new(&self.env_yaml_dir)
-            .into_iter()
-            .filter_entry(|e| {
-                if e.depth() == 0 {
-                    return true;
-                }
-                !e.file_name()
-                    .to_str()
-                    .map(|s| s.starts_with('.'))
-                    .unwrap_or(false)
-            })
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if path.is_file() {
-                if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
-                    if ext == "yaml" || ext == "yml" {
-                        if let Ok(content) = fs::read_to_string(path) {
-                            let deserializer = serde_yaml::Deserializer::from_str(&content);
-                            for document in deserializer {
-                                match serde_yaml::Value::deserialize(document) {
-                                    Ok(resource) => {
-                                        if let Some(source) =
-                                            self.extract_gcr_service(&resource, path)
-                                        {
-                                            services.insert(source);
+        for source in self.yaml_sources() {
+            if !source.root.exists() {
+                continue;
+            }
+
+            for entry in WalkDir::new(&source.root)
+                .into_iter()
+                .filter_entry(|e| {
+                    if e.depth() == 0 {
+                        return true;
+                    }
+                    !e.file_name()
+                        .to_str()
+                        .map(|s| s.starts_with('.'))
+                        .unwrap_or(false)
+                })
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+                        if ext == "yaml" || ext == "yml" {
+                            if let Ok(content) = fs::read_to_string(path) {
+                                let deserializer = serde_yaml::Deserializer::from_str(&content);
+                                for document in deserializer {
+                                    match serde_yaml::Value::deserialize(document) {
+                                        Ok(resource) => {
+                                            if let Some(source) =
+                                                self.extract_gcr_service(&source, &resource, path)
+                                            {
+                                                services.insert(source);
+                                            }
                                         }
-                                    }
-                                    Err(e) => {
-                                        let err_msg = e.to_string();
-                                        // Ignore "deserializing from YAML containing more than one document" if we are already using Deserializer
-                                        // But if it's another error, log it.
-                                        if !err_msg.contains("more than one document") {
-                                            eprintln!(
-                                                "Failed to parse YAML doc in {:?}: {}",
-                                                path, e
-                                            );
+                                        Err(e) => {
+                                            let err_msg = e.to_string();
+                                            if !err_msg.contains("more than one document") {
+                                                eprintln!(
+                                                    "Failed to parse YAML doc in {:?}: {}",
+                                                    path, e
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -92,6 +117,7 @@ impl Environment {
 
     fn extract_gcr_service(
         &self,
+        source: &YamlSource,
         resource: &serde_yaml::Value,
         yaml_path: &std::path::Path,
     ) -> Option<ServiceSource> {
@@ -129,6 +155,8 @@ impl Environment {
                     kind: kind.to_string(),
                     image_path,
                     container_name,
+                    source_name: source.name.clone(),
+                    source_root: source.root.clone(),
                     yaml_path: yaml_path.to_path_buf(),
                     namespace,
                     selector,
@@ -191,6 +219,8 @@ impl Config {
         let config: Config = toml::from_str(&content)
             .with_context(|| format!("Failed to parse TOML config at {}", config_path.display()))?;
 
+        config.validate()?;
+
         Ok(config)
     }
 
@@ -207,6 +237,44 @@ impl Config {
 
         Ok(config_path)
     }
+
+    fn validate(&self) -> Result<()> {
+        for env in &self.environments {
+            env.validate()?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Environment {
+    fn validate(&self) -> Result<()> {
+        if self.env_yaml_dir_extra.contains_key("main") {
+            return Err(anyhow::anyhow!(
+                "Environment '{}' uses reserved extra source name 'main'",
+                self.name
+            ));
+        }
+
+        let mut seen_paths = HashSet::new();
+        for source in self.yaml_sources() {
+            let normalized = normalize_source_path(&source.root);
+            if !seen_paths.insert(normalized.clone()) {
+                return Err(anyhow::anyhow!(
+                    "Environment '{}' defines duplicate YAML source path '{}' (source '{}')",
+                    self.name,
+                    normalized.display(),
+                    source.name
+                ));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+fn normalize_source_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 #[cfg(test)]
@@ -301,6 +369,7 @@ spec:
         let env = Environment {
             name: "test".to_string(),
             env_yaml_dir,
+            env_yaml_dir_extra: BTreeMap::new(),
             kubectl_context: "test".to_string(),
             gcp_project: None,
             protected: None,
@@ -342,6 +411,75 @@ spec:
 
         assert!(!services.iter().any(|s| s.name == "not-a-microservice"));
         assert!(!services.iter().any(|s| s.name == "dockerhub-service"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_services_includes_named_extra_sources() -> Result<()> {
+        let dir = tempdir()?;
+        let env_yaml_dir = dir.path().join("main");
+        let extra_yaml_dir = dir.path().join("demo");
+        fs::create_dir_all(&env_yaml_dir)?;
+        fs::create_dir_all(&extra_yaml_dir)?;
+
+        fs::write(
+            env_yaml_dir.join("main.yaml"),
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shared-service
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+      - name: main
+        image: gcr.io/my-project/shared:main
+"#,
+        )?;
+
+        fs::write(
+            extra_yaml_dir.join("demo.yaml"),
+            r#"
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shared-service
+  namespace: default
+spec:
+  template:
+    spec:
+      containers:
+      - name: demo
+        image: gcr.io/my-project/shared:demo
+"#,
+        )?;
+
+        let env = Environment {
+            name: "test".to_string(),
+            env_yaml_dir: env_yaml_dir.clone(),
+            env_yaml_dir_extra: BTreeMap::from([("demo".to_string(), extra_yaml_dir.clone())]),
+            kubectl_context: "test".to_string(),
+            gcp_project: None,
+            protected: None,
+        };
+
+        let services = env.list_services()?;
+        assert_eq!(services.len(), 2);
+
+        let main_service = services
+            .iter()
+            .find(|s| s.source_name == "main")
+            .expect("main source service");
+        assert_eq!(main_service.source_root, env_yaml_dir);
+
+        let demo_service = services
+            .iter()
+            .find(|s| s.source_name == "demo")
+            .expect("demo source service");
+        assert_eq!(demo_service.source_root, extra_yaml_dir);
 
         Ok(())
     }

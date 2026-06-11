@@ -34,12 +34,13 @@ Example configuration:
 ```toml
 [[environments]]
 name = "staging"
-repo_root = "/path/to/infra-repo/k8s/staging"
+env_yaml_dir = "/path/to/infra-repo/k8s/staging"
+env_yaml_dir_extra.demo = "/path/to/infra-demo-repo/k8s/staging"
 kubectl_context = "gke_context_staging"
 
 [[environments]]
 name = "production"
-repo_root = "/path/to/infra-repo/k8s/prod"
+env_yaml_dir = "/path/to/infra-repo/k8s/prod"
 kubectl_context = "gke_context_prod"
 protected = true
 ```

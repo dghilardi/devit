@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Added support for named `env_yaml_dir_extra` YAML sources, with tolerant `git pull` across all configured sources and source-aware Git/file display behavior for multi-repo environments.
 - Updated `davit info` to run `git pull` before loading services and to show a YAML vs cluster image comparison, highlighting version drift when present.
 
 ## [0.1.3] 2026-03-26
