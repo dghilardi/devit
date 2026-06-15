@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -33,6 +33,8 @@ pub struct Dashboard {
     old_logs: Vec<String>,
     new_logs: Vec<String>,
     tailed_pods: HashSet<String>,
+    pod_rx: mpsc::UnboundedReceiver<Vec<Pod>>,
+    pod_tx: mpsc::UnboundedSender<Vec<Pod>>,
     log_rx: mpsc::UnboundedReceiver<LogLine>,
     log_tx: mpsc::UnboundedSender<LogLine>,
 }
@@ -64,6 +66,7 @@ impl Dashboard {
         selector: Option<String>,
         container_name: String,
     ) -> Self {
+        let (pod_tx, pod_rx) = mpsc::unbounded_channel();
         let (log_tx, log_rx) = mpsc::unbounded_channel();
         Self {
             service,
@@ -77,6 +80,8 @@ impl Dashboard {
             old_logs: Vec::new(),
             new_logs: Vec::new(),
             tailed_pods: HashSet::new(),
+            pod_rx,
+            pod_tx,
             log_rx,
             log_tx,
         }
@@ -128,11 +133,23 @@ impl Dashboard {
             .unwrap_or_else(|| format!("app={}", self.service));
         let lp = ListParams::default().labels(&selector);
 
+        let pod_tx = self.pod_tx.clone();
+        let pods_api_refresh = pods_api.clone();
+        let lp_refresh = lp.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(pod_list) = pods_api_refresh.list(&lp_refresh).await {
+                    let _ = pod_tx.send(pod_list.items);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+
         loop {
             // 1. Update pod list
-            if let Ok(pod_list) = pods_api.list(&lp).await {
+            while let Ok(pod_list) = self.pod_rx.try_recv() {
                 let mut current_pods = Vec::new();
-                for p in pod_list.items {
+                for p in pod_list {
                     let name = p.metadata.name.clone().unwrap_or_default();
                     let status = p
                         .status
@@ -159,10 +176,12 @@ impl Dashboard {
                         let p_name = name.clone();
                         let container = self.container_name.clone();
                         tokio::spawn(async move {
-                            let mut lp = LogParams::default();
-                            lp.follow = true;
-                            lp.tail_lines = Some(10);
-                            lp.container = Some(container);
+                            let lp = LogParams {
+                                follow: true,
+                                tail_lines: Some(10),
+                                container: Some(container),
+                                ..Default::default()
+                            };
 
                             match api.log_stream(&p_name, &lp).await {
                                 Ok(stream) => {
@@ -230,13 +249,11 @@ impl Dashboard {
                         });
                     }
 
-                    let container_statuses =
-                        p.status.as_ref().and_then(|s| s.container_statuses.as_ref());
-                    let total_containers = p
-                        .spec
+                    let container_statuses = p
+                        .status
                         .as_ref()
-                        .map(|s| s.containers.len())
-                        .unwrap_or(0);
+                        .and_then(|s| s.container_statuses.as_ref());
+                    let total_containers = p.spec.as_ref().map(|s| s.containers.len()).unwrap_or(0);
                     let ready_count = container_statuses
                         .map(|cs| cs.iter().filter(|c| c.ready).count())
                         .unwrap_or(0);
@@ -263,7 +280,10 @@ impl Dashboard {
             }
 
             // 2. Consume logs
-            while let Ok(log) = self.log_rx.try_recv() {
+            for _ in 0..200 {
+                let Ok(log) = self.log_rx.try_recv() else {
+                    break;
+                };
                 let display_line = self.format_log_line(&log);
                 if log.is_new {
                     self.new_logs.push(display_line);
@@ -284,10 +304,16 @@ impl Dashboard {
                 .map_err(|e| anyhow::anyhow!("Draw error: {}", e))?;
 
             // 4. Handle input
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()? {
-                    if let KeyCode::Char('q') = key.code {
+            if event::poll(Duration::from_millis(50))? {
+                loop {
+                    if let Event::Key(key) = event::read()?
+                        && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && let KeyCode::Char('q') = key.code
+                    {
                         return Ok(());
+                    }
+                    if !event::poll(Duration::from_millis(0))? {
+                        break;
                     }
                 }
             }
@@ -295,11 +321,11 @@ impl Dashboard {
     }
 
     fn format_log_line(&self, log: &LogLine) -> String {
-        let pod_id = log.pod_name.split('-').last().unwrap_or("");
+        let pod_id = log.pod_name.split('-').next_back().unwrap_or("");
         let ts = log
             .timestamp
             .as_deref()
-            .and_then(|t| t.split('T').last())
+            .and_then(|t| t.split('T').next_back())
             .map(|t| t.split('.').next().unwrap_or(t))
             .map(|t| format!("{} ", t))
             .unwrap_or_default();

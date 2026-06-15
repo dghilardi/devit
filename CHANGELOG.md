@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Improved dashboard responsiveness so quitting with `q` stays immediate even when Kubernetes pod refreshes are slow.
+
 ## [0.2.0] 2026-06-11
 
 ### Changed
