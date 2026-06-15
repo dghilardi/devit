@@ -16,7 +16,7 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListDirection, ListItem, Paragraph},
 };
 use std::{collections::HashSet, io, time::Duration};
 use tokio::sync::mpsc;
@@ -404,7 +404,8 @@ impl Dashboard {
             Block::default()
                 .title(" Old Pod Logs ")
                 .borders(Borders::ALL),
-        );
+        )
+        .direction(ListDirection::BottomToTop);
         f.render_widget(old_list, log_chunks[0]);
 
         let new_logs: Vec<ListItem> = self
@@ -421,7 +422,8 @@ impl Dashboard {
             Block::default()
                 .title(" New Pod Logs ")
                 .borders(Borders::ALL),
-        );
+        )
+        .direction(ListDirection::BottomToTop);
         f.render_widget(new_list, log_chunks[1]);
     }
 
