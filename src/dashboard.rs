@@ -18,8 +18,18 @@ use ratatui::{
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, List, ListDirection, ListItem, Paragraph},
 };
-use std::{collections::HashSet, io, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    io,
+    time::{Duration, Instant},
+};
 use tokio::sync::mpsc;
+
+const MAX_LOG_LINES: usize = 100;
+const VISIBLE_LOG_LINES: usize = 50;
+const LOG_BATCH_SIZE: usize = 400;
+const UI_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const HEADER_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct Dashboard {
     service: String,
@@ -30,8 +40,8 @@ pub struct Dashboard {
     selector: Option<String>,
     container_name: String,
     pods: Vec<PodInfo>,
-    old_logs: Vec<String>,
-    new_logs: Vec<String>,
+    old_logs: VecDeque<String>,
+    new_logs: VecDeque<String>,
     tailed_pods: HashSet<String>,
     pod_rx: mpsc::UnboundedReceiver<Vec<Pod>>,
     pod_tx: mpsc::UnboundedSender<Vec<Pod>>,
@@ -77,8 +87,8 @@ impl Dashboard {
             selector,
             container_name,
             pods: Vec::new(),
-            old_logs: Vec::new(),
-            new_logs: Vec::new(),
+            old_logs: VecDeque::with_capacity(MAX_LOG_LINES),
+            new_logs: VecDeque::with_capacity(MAX_LOG_LINES),
             tailed_pods: HashSet::new(),
             pod_rx,
             pod_tx,
@@ -145,6 +155,9 @@ impl Dashboard {
             }
         });
 
+        let mut last_header_refresh = Instant::now();
+        let mut needs_redraw = true;
+
         loop {
             // 1. Update pod list
             while let Ok(pod_list) = self.pod_rx.try_recv() {
@@ -189,19 +202,19 @@ impl Dashboard {
                                     let mut lines = stream.lines();
                                     while let Some(res) = lines.next().await {
                                         if let Ok(line) = res {
-                                            let raw_content = line.trim().to_string();
+                                            let raw_content = line.trim();
                                             let mut log_line = LogLine {
                                                 pod_name: p_name.clone(),
-                                                content: raw_content.clone(),
+                                                content: raw_content.to_string(),
                                                 level: None,
                                                 timestamp: None,
                                                 is_new,
                                             };
 
-                                            // Attempt JSON parsing
-                                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(
-                                                &raw_content,
-                                            ) {
+                                            // Attempt JSON parsing only when the line looks like JSON.
+                                            if raw_content.starts_with('{')
+                                                && let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_content)
+                                            {
                                                 // Extract level - GKE uses 'severity', others 'level'
                                                 log_line.level = v
                                                     .get("severity")
@@ -277,34 +290,44 @@ impl Dashboard {
                     });
                 }
                 self.pods = current_pods;
+                needs_redraw = true;
             }
 
             // 2. Consume logs
-            for _ in 0..200 {
+            for _ in 0..LOG_BATCH_SIZE {
                 let Ok(log) = self.log_rx.try_recv() else {
                     break;
                 };
                 let display_line = self.format_log_line(&log);
                 if log.is_new {
-                    self.new_logs.push(display_line);
-                    if self.new_logs.len() > 100 {
-                        self.new_logs.remove(0);
+                    self.new_logs.push_back(display_line);
+                    if self.new_logs.len() > MAX_LOG_LINES {
+                        self.new_logs.pop_front();
                     }
                 } else {
-                    self.old_logs.push(display_line);
-                    if self.old_logs.len() > 100 {
-                        self.old_logs.remove(0);
+                    self.old_logs.push_back(display_line);
+                    if self.old_logs.len() > MAX_LOG_LINES {
+                        self.old_logs.pop_front();
                     }
                 }
+                needs_redraw = true;
+            }
+
+            if last_header_refresh.elapsed() >= HEADER_REFRESH_INTERVAL {
+                last_header_refresh = Instant::now();
+                needs_redraw = true;
             }
 
             // 3. Render
-            terminal
-                .draw(|f| self.ui(f))
-                .map_err(|e| anyhow::anyhow!("Draw error: {}", e))?;
+            if needs_redraw {
+                terminal
+                    .draw(|f| self.ui(f))
+                    .map_err(|e| anyhow::anyhow!("Draw error: {}", e))?;
+                needs_redraw = false;
+            }
 
             // 4. Handle input
-            if event::poll(Duration::from_millis(50))? {
+            if event::poll(UI_POLL_INTERVAL)? {
                 loop {
                     if let Event::Key(key) = event::read()?
                         && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
@@ -394,7 +417,7 @@ impl Dashboard {
             .old_logs
             .iter()
             .rev()
-            .take(50)
+            .take(VISIBLE_LOG_LINES)
             .map(|l| {
                 let style = self.get_log_style(l, Color::DarkGray);
                 ListItem::new(l.as_str()).style(style)
@@ -412,7 +435,7 @@ impl Dashboard {
             .new_logs
             .iter()
             .rev()
-            .take(50)
+            .take(VISIBLE_LOG_LINES)
             .map(|l| {
                 let style = self.get_log_style(l, Color::Green);
                 ListItem::new(l.as_str()).style(style)
