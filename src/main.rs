@@ -10,7 +10,7 @@ use blueprint::Blueprint;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use config::{Config, Environment, ServiceSource, YamlSource};
-use dashboard::Dashboard;
+use dashboard::{Dashboard, DashboardExit};
 use git::Git;
 use inquire::{Confirm, Select, Text};
 use registry::{ImageMetadata, Registry};
@@ -210,6 +210,7 @@ async fn main() -> Result<()> {
 
             let mut dashboard = Dashboard::new(
                 selected_service.name.clone(),
+                selected_service.kind.clone(),
                 selected_env.name.clone(),
                 selected_tag.clone(),
                 selected_env.kubectl_context.clone(),
@@ -219,16 +220,24 @@ async fn main() -> Result<()> {
             );
             let res = dashboard.run().await;
 
-            if let Err(e) = res {
-                println!("❌ Dashboard error or aborted: {}", e);
-                if Confirm::new("Revert local YAML changes?")
-                    .with_default(true)
-                    .prompt()?
-                {
-                    fs::write(&yaml_path, &original_content)?;
-                    println!("YAML reverted.");
+            match res {
+                Err(e) => {
+                    println!("❌ Dashboard error or aborted: {}", e);
+                    if Confirm::new("Revert local YAML changes?")
+                        .with_default(true)
+                        .prompt()?
+                    {
+                        fs::write(&yaml_path, &original_content)?;
+                        println!("YAML reverted.");
+                    }
+                    return Err(e);
                 }
-                return Err(e);
+                Ok(DashboardExit::UserQuit) => {
+                    println!("Dashboard closed before rollout completion check.");
+                }
+                Ok(DashboardExit::RolloutCompleted) => {
+                    println!("Rollout completed. Continuing to the Git step...");
+                }
             }
 
             // 6.1 Git Automation
