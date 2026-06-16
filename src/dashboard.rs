@@ -30,6 +30,10 @@ const VISIBLE_LOG_LINES: usize = 50;
 const LOG_BATCH_SIZE: usize = 400;
 const UI_POLL_INTERVAL: Duration = Duration::from_millis(16);
 const HEADER_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const HEADER_HEIGHT: u16 = 3;
+const POD_PANEL_MIN_HEIGHT: u16 = 4;
+const POD_PANEL_MAX_HEIGHT: u16 = 10;
+const LOG_PANEL_MIN_HEIGHT: u16 = 6;
 
 pub struct Dashboard {
     service: String,
@@ -358,12 +362,13 @@ impl Dashboard {
     }
 
     fn ui(&self, f: &mut Frame) {
+        let pod_panel_height = self.pod_panel_height(f.area().height);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
-                Constraint::Min(6),
-                Constraint::Percentage(60),
+                Constraint::Length(HEADER_HEIGHT),
+                Constraint::Length(pod_panel_height),
+                Constraint::Min(LOG_PANEL_MIN_HEIGHT),
             ])
             .split(f.area());
 
@@ -448,6 +453,15 @@ impl Dashboard {
         )
         .direction(ListDirection::BottomToTop);
         f.render_widget(new_list, log_chunks[1]);
+    }
+
+    fn pod_panel_height(&self, total_height: u16) -> u16 {
+        let desired_height = (self.pods.len() as u16).saturating_add(2);
+        let clamped_height = desired_height.clamp(POD_PANEL_MIN_HEIGHT, POD_PANEL_MAX_HEIGHT);
+        let available_height = total_height.saturating_sub(HEADER_HEIGHT);
+        let max_pod_height = available_height.saturating_sub(LOG_PANEL_MIN_HEIGHT);
+
+        clamped_height.clamp(POD_PANEL_MIN_HEIGHT, max_pod_height.max(POD_PANEL_MIN_HEIGHT))
     }
 
     fn get_log_style(&self, line: &str, default_color: Color) -> Style {
