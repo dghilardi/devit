@@ -194,6 +194,7 @@ impl Dashboard {
         let rollout_kind = self.workload_kind.clone();
         let rollout_name = self.service.clone();
         let rollout_tag = self.tag.clone();
+        let rollout_container_name = self.container_name.clone();
         let rollout_client = client.clone();
         let rollout_namespace = namespace.clone();
         tokio::spawn(async move {
@@ -204,6 +205,7 @@ impl Dashboard {
                     &rollout_kind,
                     &rollout_name,
                     &rollout_tag,
+                    &rollout_container_name,
                 )
                 .await
                 {
@@ -231,13 +233,14 @@ impl Dashboard {
                     let is_new = p
                         .spec
                         .as_ref()
-                        .and_then(|s| s.containers.first())
-                        .map(|c| {
-                            c.image
-                                .as_ref()
-                                .map(|i| i.contains(&self.tag))
-                                .unwrap_or(false)
+                        .and_then(|s| {
+                            s.containers
+                                .iter()
+                                .find(|c| c.name == self.container_name)
+                                .or_else(|| s.containers.first())
                         })
+                        .and_then(|c| c.image.as_ref())
+                        .map(|image| image.contains(&self.tag))
                         .unwrap_or(false);
 
                     if !self.tailed_pods.contains(&name) && status == "Running" {
@@ -604,29 +607,42 @@ async fn fetch_rollout_status(
     workload_kind: &str,
     workload_name: &str,
     tag: &str,
+    container_name: &str,
 ) -> Result<RolloutStatus> {
     match workload_kind {
         "Deployment" => {
             let api: Api<Deployment> = Api::namespaced(client, namespace);
             let deployment = api.get(workload_name).await?;
-            Ok(RolloutStatus::from_deployment(&deployment, tag))
+            Ok(RolloutStatus::from_deployment(
+                &deployment,
+                tag,
+                container_name,
+            ))
         }
         "StatefulSet" => {
             let api: Api<StatefulSet> = Api::namespaced(client, namespace);
             let statefulset = api.get(workload_name).await?;
-            Ok(RolloutStatus::from_statefulset(&statefulset, tag))
+            Ok(RolloutStatus::from_statefulset(
+                &statefulset,
+                tag,
+                container_name,
+            ))
         }
         "DaemonSet" => {
             let api: Api<DaemonSet> = Api::namespaced(client, namespace);
             let daemonset = api.get(workload_name).await?;
-            Ok(RolloutStatus::from_daemonset(&daemonset, tag))
+            Ok(RolloutStatus::from_daemonset(
+                &daemonset,
+                tag,
+                container_name,
+            ))
         }
         _ => Ok(RolloutStatus::default()),
     }
 }
 
 impl RolloutStatus {
-    fn from_deployment(deployment: &Deployment, tag: &str) -> Self {
+    fn from_deployment(deployment: &Deployment, tag: &str, container_name: &str) -> Self {
         let spec = deployment.spec.as_ref();
         let status = deployment.status.as_ref();
         let desired_replicas = spec.and_then(|s| s.replicas);
@@ -636,7 +652,7 @@ impl RolloutStatus {
         let desired = desired_replicas.unwrap_or(1);
 
         Self {
-            template_matches_tag: workload_template_matches_tag(spec, tag),
+            template_matches_tag: workload_template_matches_tag(spec, container_name, tag),
             workload_complete: desired > 0
                 && ready_replicas.unwrap_or(0) >= desired
                 && available_replicas.unwrap_or(0) >= desired
@@ -644,7 +660,7 @@ impl RolloutStatus {
         }
     }
 
-    fn from_statefulset(statefulset: &StatefulSet, tag: &str) -> Self {
+    fn from_statefulset(statefulset: &StatefulSet, tag: &str, container_name: &str) -> Self {
         let spec = statefulset.spec.as_ref();
         let status = statefulset.status.as_ref();
         let desired_replicas = spec.and_then(|s| s.replicas);
@@ -653,14 +669,14 @@ impl RolloutStatus {
         let desired = desired_replicas.unwrap_or(1);
 
         Self {
-            template_matches_tag: workload_template_matches_tag(spec, tag),
+            template_matches_tag: workload_template_matches_tag(spec, container_name, tag),
             workload_complete: desired > 0
                 && ready_replicas.unwrap_or(0) >= desired
                 && updated_replicas.unwrap_or(0) >= desired,
         }
     }
 
-    fn from_daemonset(daemonset: &DaemonSet, tag: &str) -> Self {
+    fn from_daemonset(daemonset: &DaemonSet, tag: &str, container_name: &str) -> Self {
         let spec = daemonset.spec.as_ref();
         let status = daemonset.status.as_ref();
         let desired_replicas = status.map(|s| s.desired_number_scheduled);
@@ -670,7 +686,7 @@ impl RolloutStatus {
         let desired = desired_replicas.unwrap_or(1);
 
         Self {
-            template_matches_tag: workload_template_matches_tag(spec, tag),
+            template_matches_tag: workload_template_matches_tag(spec, container_name, tag),
             workload_complete: desired > 0
                 && ready_replicas.unwrap_or(0) >= desired
                 && available_replicas.unwrap_or(0) >= desired
@@ -679,51 +695,54 @@ impl RolloutStatus {
     }
 }
 
-fn workload_template_matches_tag<T>(spec: Option<&T>, tag: &str) -> bool
+fn workload_template_matches_tag<T>(spec: Option<&T>, container_name: &str, tag: &str) -> bool
 where
     T: WorkloadTemplateSpec,
 {
-    spec.and_then(|s| s.container_images())
-        .map(|images| !images.is_empty() && images.iter().all(|image| image.contains(tag)))
+    spec.and_then(|s| s.container_image(container_name))
+        .map(|image| image.contains(tag))
         .unwrap_or(false)
 }
 
 trait WorkloadTemplateSpec {
-    fn container_images(&self) -> Option<Vec<String>>;
+    fn container_image(&self, container_name: &str) -> Option<String>;
 }
 
 impl WorkloadTemplateSpec for k8s_openapi::api::apps::v1::DeploymentSpec {
-    fn container_images(&self) -> Option<Vec<String>> {
-        self.template.spec.as_ref().map(|pod_spec| {
+    fn container_image(&self, container_name: &str) -> Option<String> {
+        self.template.spec.as_ref().and_then(|pod_spec| {
             pod_spec
                 .containers
                 .iter()
-                .filter_map(|container| container.image.clone())
-                .collect()
+                .find(|container| container.name == container_name)
+                .or_else(|| pod_spec.containers.first())
+                .and_then(|container| container.image.clone())
         })
     }
 }
 
 impl WorkloadTemplateSpec for k8s_openapi::api::apps::v1::StatefulSetSpec {
-    fn container_images(&self) -> Option<Vec<String>> {
-        self.template.spec.as_ref().map(|pod_spec| {
+    fn container_image(&self, container_name: &str) -> Option<String> {
+        self.template.spec.as_ref().and_then(|pod_spec| {
             pod_spec
                 .containers
                 .iter()
-                .filter_map(|container| container.image.clone())
-                .collect()
+                .find(|container| container.name == container_name)
+                .or_else(|| pod_spec.containers.first())
+                .and_then(|container| container.image.clone())
         })
     }
 }
 
 impl WorkloadTemplateSpec for k8s_openapi::api::apps::v1::DaemonSetSpec {
-    fn container_images(&self) -> Option<Vec<String>> {
-        self.template.spec.as_ref().map(|pod_spec| {
+    fn container_image(&self, container_name: &str) -> Option<String> {
+        self.template.spec.as_ref().and_then(|pod_spec| {
             pod_spec
                 .containers
                 .iter()
-                .filter_map(|container| container.image.clone())
-                .collect()
+                .find(|container| container.name == container_name)
+                .or_else(|| pod_spec.containers.first())
+                .and_then(|container| container.image.clone())
         })
     }
 }
