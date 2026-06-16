@@ -5,6 +5,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use futures::StreamExt;
+use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, StatefulSet};
 use k8s_openapi::api::core::v1::Pod;
 use kube::{
     Api, Client,
@@ -14,9 +15,9 @@ use kube::{
 use ratatui::{
     Frame, Terminal,
     backend::{Backend, CrosstermBackend},
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, List, ListDirection, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListDirection, ListItem, Paragraph, Wrap},
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -35,8 +36,14 @@ const POD_PANEL_MIN_HEIGHT: u16 = 4;
 const POD_PANEL_MAX_HEIGHT: u16 = 10;
 const LOG_PANEL_MIN_HEIGHT: u16 = 6;
 
+pub enum DashboardExit {
+    UserQuit,
+    RolloutCompleted,
+}
+
 pub struct Dashboard {
     service: String,
+    workload_kind: String,
     env_name: String,
     tag: String,
     kubectl_context: String,
@@ -49,8 +56,13 @@ pub struct Dashboard {
     tailed_pods: HashSet<String>,
     pod_rx: mpsc::UnboundedReceiver<Vec<Pod>>,
     pod_tx: mpsc::UnboundedSender<Vec<Pod>>,
+    rollout_status: RolloutStatus,
+    rollout_rx: mpsc::UnboundedReceiver<RolloutStatus>,
+    rollout_tx: mpsc::UnboundedSender<RolloutStatus>,
     log_rx: mpsc::UnboundedReceiver<LogLine>,
     log_tx: mpsc::UnboundedSender<LogLine>,
+    completion_modal_visible: bool,
+    completion_acknowledged: bool,
 }
 
 struct LogLine {
@@ -65,14 +77,23 @@ struct PodInfo {
     name: String,
     status: String,
     ready: String,
+    ready_count: usize,
+    total_containers: usize,
     restarts: i32,
     age: String,
     is_new: bool,
 }
 
+#[derive(Clone, Default)]
+struct RolloutStatus {
+    template_matches_tag: bool,
+    workload_complete: bool,
+}
+
 impl Dashboard {
     pub fn new(
         service: String,
+        workload_kind: String,
         env_name: String,
         tag: String,
         kubectl_context: String,
@@ -81,9 +102,11 @@ impl Dashboard {
         container_name: String,
     ) -> Self {
         let (pod_tx, pod_rx) = mpsc::unbounded_channel();
+        let (rollout_tx, rollout_rx) = mpsc::unbounded_channel();
         let (log_tx, log_rx) = mpsc::unbounded_channel();
         Self {
             service,
+            workload_kind,
             env_name,
             tag,
             kubectl_context,
@@ -96,12 +119,17 @@ impl Dashboard {
             tailed_pods: HashSet::new(),
             pod_rx,
             pod_tx,
+            rollout_status: RolloutStatus::default(),
+            rollout_rx,
+            rollout_tx,
             log_rx,
             log_tx,
+            completion_modal_visible: false,
+            completion_acknowledged: false,
         }
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self) -> Result<DashboardExit> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -134,12 +162,15 @@ impl Dashboard {
         &mut self,
         terminal: &mut Terminal<B>,
         client: Client,
-    ) -> Result<()>
+    ) -> Result<DashboardExit>
     where
         B::Error: std::fmt::Display,
     {
-        let ns = self.namespace.as_deref().unwrap_or("default");
-        let pods_api: Api<Pod> = Api::namespaced(client.clone(), ns);
+        let namespace = self
+            .namespace
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let pods_api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
 
         let selector = self
             .selector
@@ -154,6 +185,31 @@ impl Dashboard {
             loop {
                 if let Ok(pod_list) = pods_api_refresh.list(&lp_refresh).await {
                     let _ = pod_tx.send(pod_list.items);
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+
+        let rollout_tx = self.rollout_tx.clone();
+        let rollout_kind = self.workload_kind.clone();
+        let rollout_name = self.service.clone();
+        let rollout_tag = self.tag.clone();
+        let rollout_container_name = self.container_name.clone();
+        let rollout_client = client.clone();
+        let rollout_namespace = namespace.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok(status) = fetch_rollout_status(
+                    rollout_client.clone(),
+                    &rollout_namespace,
+                    &rollout_kind,
+                    &rollout_name,
+                    &rollout_tag,
+                    &rollout_container_name,
+                )
+                .await
+                {
+                    let _ = rollout_tx.send(status);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -177,13 +233,14 @@ impl Dashboard {
                     let is_new = p
                         .spec
                         .as_ref()
-                        .and_then(|s| s.containers.first())
-                        .map(|c| {
-                            c.image
-                                .as_ref()
-                                .map(|i| i.contains(&self.tag))
-                                .unwrap_or(false)
+                        .and_then(|s| {
+                            s.containers
+                                .iter()
+                                .find(|c| c.name == self.container_name)
+                                .or_else(|| s.containers.first())
                         })
+                        .and_then(|c| c.image.as_ref())
+                        .map(|image| image.contains(&self.tag))
                         .unwrap_or(false);
 
                     if !self.tailed_pods.contains(&name) && status == "Running" {
@@ -288,12 +345,21 @@ impl Dashboard {
                         name,
                         status,
                         ready: format!("{}/{}", ready_count, total_containers),
+                        ready_count,
+                        total_containers,
                         restarts,
                         age,
                         is_new,
                     });
                 }
                 self.pods = current_pods;
+                self.update_rollout_modal_state();
+                needs_redraw = true;
+            }
+
+            while let Ok(rollout_status) = self.rollout_rx.try_recv() {
+                self.rollout_status = rollout_status;
+                self.update_rollout_modal_state();
                 needs_redraw = true;
             }
 
@@ -335,9 +401,22 @@ impl Dashboard {
                 loop {
                     if let Event::Key(key) = event::read()?
                         && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                        && let KeyCode::Char('q') = key.code
                     {
-                        return Ok(());
+                        if self.completion_modal_visible {
+                            match key.code {
+                                KeyCode::Enter | KeyCode::Char('c') => {
+                                    return Ok(DashboardExit::RolloutCompleted);
+                                }
+                                KeyCode::Esc | KeyCode::Char('k') => {
+                                    self.completion_modal_visible = false;
+                                    self.completion_acknowledged = true;
+                                    needs_redraw = true;
+                                }
+                                _ => {}
+                            }
+                        } else if let KeyCode::Char('q') = key.code {
+                            return Ok(DashboardExit::UserQuit);
+                        }
                     }
                     if !event::poll(Duration::from_millis(0))? {
                         break;
@@ -453,6 +532,10 @@ impl Dashboard {
         )
         .direction(ListDirection::BottomToTop);
         f.render_widget(new_list, log_chunks[1]);
+
+        if self.completion_modal_visible {
+            self.render_completion_modal(f);
+        }
     }
 
     fn pod_panel_height(&self, total_height: u16) -> u16 {
@@ -464,6 +547,49 @@ impl Dashboard {
         clamped_height.clamp(POD_PANEL_MIN_HEIGHT, max_pod_height.max(POD_PANEL_MIN_HEIGHT))
     }
 
+    fn update_rollout_modal_state(&mut self) {
+        if self.is_rollout_complete() {
+            if !self.completion_acknowledged {
+                self.completion_modal_visible = true;
+            }
+        } else {
+            self.completion_modal_visible = false;
+            self.completion_acknowledged = false;
+        }
+    }
+
+    fn is_rollout_complete(&self) -> bool {
+        let has_new_pods = self.pods.iter().any(|pod| pod.is_new);
+        let old_pods_gone = self.pods.iter().all(|pod| pod.is_new);
+        let new_pods_ready = self
+            .pods
+            .iter()
+            .filter(|pod| pod.is_new)
+            .all(|pod| pod.status == "Running" && pod.ready_count == pod.total_containers);
+
+        has_new_pods
+            && old_pods_gone
+            && new_pods_ready
+            && self.rollout_status.template_matches_tag
+            && self.rollout_status.workload_complete
+    }
+
+    fn render_completion_modal(&self, f: &mut Frame) {
+        let area = centered_rect(72, 9, f.area());
+        let text = "Release rollout completed.\nAll impacted pods are on the requested tag and reported ready.\n\nEnter/c: close dashboard and continue\nEsc/k: keep dashboard open";
+        let modal = Paragraph::new(text)
+            .block(
+                Block::default()
+                    .title(" Rollout Completed ")
+                    .borders(Borders::ALL),
+            )
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
+
+        f.render_widget(Clear, area);
+        f.render_widget(modal, area);
+    }
+
     fn get_log_style(&self, line: &str, default_color: Color) -> Style {
         if line.contains("ERROR") || line.contains("FATAL") {
             Style::default().fg(Color::Red)
@@ -473,6 +599,162 @@ impl Dashboard {
             Style::default().fg(default_color)
         }
     }
+}
+
+async fn fetch_rollout_status(
+    client: Client,
+    namespace: &str,
+    workload_kind: &str,
+    workload_name: &str,
+    tag: &str,
+    container_name: &str,
+) -> Result<RolloutStatus> {
+    match workload_kind {
+        "Deployment" => {
+            let api: Api<Deployment> = Api::namespaced(client, namespace);
+            let deployment = api.get(workload_name).await?;
+            Ok(RolloutStatus::from_deployment(
+                &deployment,
+                tag,
+                container_name,
+            ))
+        }
+        "StatefulSet" => {
+            let api: Api<StatefulSet> = Api::namespaced(client, namespace);
+            let statefulset = api.get(workload_name).await?;
+            Ok(RolloutStatus::from_statefulset(
+                &statefulset,
+                tag,
+                container_name,
+            ))
+        }
+        "DaemonSet" => {
+            let api: Api<DaemonSet> = Api::namespaced(client, namespace);
+            let daemonset = api.get(workload_name).await?;
+            Ok(RolloutStatus::from_daemonset(
+                &daemonset,
+                tag,
+                container_name,
+            ))
+        }
+        _ => Ok(RolloutStatus::default()),
+    }
+}
+
+impl RolloutStatus {
+    fn from_deployment(deployment: &Deployment, tag: &str, container_name: &str) -> Self {
+        let spec = deployment.spec.as_ref();
+        let status = deployment.status.as_ref();
+        let desired_replicas = spec.and_then(|s| s.replicas);
+        let ready_replicas = status.and_then(|s| s.ready_replicas);
+        let available_replicas = status.and_then(|s| s.available_replicas);
+        let updated_replicas = status.and_then(|s| s.updated_replicas);
+        let desired = desired_replicas.unwrap_or(1);
+
+        Self {
+            template_matches_tag: workload_template_matches_tag(spec, container_name, tag),
+            workload_complete: desired > 0
+                && ready_replicas.unwrap_or(0) >= desired
+                && available_replicas.unwrap_or(0) >= desired
+                && updated_replicas.unwrap_or(0) >= desired,
+        }
+    }
+
+    fn from_statefulset(statefulset: &StatefulSet, tag: &str, container_name: &str) -> Self {
+        let spec = statefulset.spec.as_ref();
+        let status = statefulset.status.as_ref();
+        let desired_replicas = spec.and_then(|s| s.replicas);
+        let ready_replicas = status.and_then(|s| s.ready_replicas);
+        let updated_replicas = status.and_then(|s| s.updated_replicas);
+        let desired = desired_replicas.unwrap_or(1);
+
+        Self {
+            template_matches_tag: workload_template_matches_tag(spec, container_name, tag),
+            workload_complete: desired > 0
+                && ready_replicas.unwrap_or(0) >= desired
+                && updated_replicas.unwrap_or(0) >= desired,
+        }
+    }
+
+    fn from_daemonset(daemonset: &DaemonSet, tag: &str, container_name: &str) -> Self {
+        let spec = daemonset.spec.as_ref();
+        let status = daemonset.status.as_ref();
+        let desired_replicas = status.map(|s| s.desired_number_scheduled);
+        let ready_replicas = status.map(|s| s.number_ready);
+        let available_replicas = status.and_then(|s| s.number_available);
+        let updated_replicas = status.and_then(|s| s.updated_number_scheduled);
+        let desired = desired_replicas.unwrap_or(1);
+
+        Self {
+            template_matches_tag: workload_template_matches_tag(spec, container_name, tag),
+            workload_complete: desired > 0
+                && ready_replicas.unwrap_or(0) >= desired
+                && available_replicas.unwrap_or(0) >= desired
+                && updated_replicas.unwrap_or(0) >= desired,
+        }
+    }
+}
+
+fn workload_template_matches_tag<T>(spec: Option<&T>, container_name: &str, tag: &str) -> bool
+where
+    T: WorkloadTemplateSpec,
+{
+    spec.and_then(|s| s.container_image(container_name))
+        .map(|image| image.contains(tag))
+        .unwrap_or(false)
+}
+
+trait WorkloadTemplateSpec {
+    fn container_image(&self, container_name: &str) -> Option<String>;
+}
+
+impl WorkloadTemplateSpec for k8s_openapi::api::apps::v1::DeploymentSpec {
+    fn container_image(&self, container_name: &str) -> Option<String> {
+        self.template.spec.as_ref().and_then(|pod_spec| {
+            pod_spec
+                .containers
+                .iter()
+                .find(|container| container.name == container_name)
+                .or_else(|| pod_spec.containers.first())
+                .and_then(|container| container.image.clone())
+        })
+    }
+}
+
+impl WorkloadTemplateSpec for k8s_openapi::api::apps::v1::StatefulSetSpec {
+    fn container_image(&self, container_name: &str) -> Option<String> {
+        self.template.spec.as_ref().and_then(|pod_spec| {
+            pod_spec
+                .containers
+                .iter()
+                .find(|container| container.name == container_name)
+                .or_else(|| pod_spec.containers.first())
+                .and_then(|container| container.image.clone())
+        })
+    }
+}
+
+impl WorkloadTemplateSpec for k8s_openapi::api::apps::v1::DaemonSetSpec {
+    fn container_image(&self, container_name: &str) -> Option<String> {
+        self.template.spec.as_ref().and_then(|pod_spec| {
+            pod_spec
+                .containers
+                .iter()
+                .find(|container| container.name == container_name)
+                .or_else(|| pod_spec.containers.first())
+                .and_then(|container| container.image.clone())
+        })
+    }
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let [vertical] = Layout::vertical([Constraint::Length(height)])
+        .flex(Flex::Center)
+        .areas(area);
+    let [horizontal] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+        .flex(Flex::Center)
+        .areas(vertical);
+    horizontal
 }
 
 fn format_age(created: k8s_openapi::jiff::Timestamp) -> String {

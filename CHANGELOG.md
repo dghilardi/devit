@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Added rollout completion detection to the post-release dashboard and a confirmation modal to either continue to the next step or keep monitoring.
 - Adjusted the post-release log dashboard so the pod status panel grows with the number of pods while keeping consistent minimum and maximum heights.
 
 ## [0.2.2] 2026-06-16
