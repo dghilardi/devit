@@ -45,6 +45,10 @@ enum Commands {
         /// Dry run: show commands without executing them
         #[arg(long)]
         dry_run: bool,
+
+        /// After `kubectl apply`, continue automatically through rollout completion and Git push unless errors occur
+        #[arg(long)]
+        auto_continue: bool,
     },
     /// Show deployment information for a service
     Info {
@@ -86,6 +90,7 @@ async fn main() -> Result<()> {
             service,
             tag,
             dry_run,
+            auto_continue,
         } => {
             let selected_env = resolve_environment(&config, env)?;
 
@@ -195,12 +200,14 @@ async fn main() -> Result<()> {
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     println!("❌ kubectl apply failed: {}", stderr);
-                    if Confirm::new("Revert local YAML changes?")
-                        .with_default(true)
-                        .prompt()?
-                    {
-                        fs::write(&yaml_path, &original_content)?;
-                        println!("YAML reverted.");
+                    if !auto_continue {
+                        if Confirm::new("Revert local YAML changes?")
+                            .with_default(true)
+                            .prompt()?
+                        {
+                            fs::write(&yaml_path, &original_content)?;
+                            println!("YAML reverted.");
+                        }
                     }
                     return Err(anyhow::anyhow!("kubectl apply failed"));
                 }
@@ -217,22 +224,30 @@ async fn main() -> Result<()> {
                 selected_service.namespace.clone(),
                 selected_service.selector.clone(),
                 selected_service.container_name.clone(),
+                auto_continue,
             );
             let res = dashboard.run().await;
 
             match res {
                 Err(e) => {
                     println!("❌ Dashboard error or aborted: {}", e);
-                    if Confirm::new("Revert local YAML changes?")
-                        .with_default(true)
-                        .prompt()?
-                    {
-                        fs::write(&yaml_path, &original_content)?;
-                        println!("YAML reverted.");
+                    if !auto_continue {
+                        if Confirm::new("Revert local YAML changes?")
+                            .with_default(true)
+                            .prompt()?
+                        {
+                            fs::write(&yaml_path, &original_content)?;
+                            println!("YAML reverted.");
+                        }
                     }
                     return Err(e);
                 }
                 Ok(DashboardExit::UserQuit) => {
+                    if auto_continue {
+                        return Err(anyhow::anyhow!(
+                            "Dashboard closed before rollout completion in auto-continue mode"
+                        ));
+                    }
                     println!("Dashboard closed before rollout completion check.");
                 }
                 Ok(DashboardExit::RolloutCompleted) => {
@@ -253,24 +268,34 @@ async fn main() -> Result<()> {
             Blueprint::show_diff(&original_content, &updated_content, filename, true);
             println!("--------------------\n");
 
-            if Confirm::new("Do you want to commit and push these changes?")
-                .with_default(true)
-                .prompt()?
-            {
-                if let Err(e) = Git::commit_and_push(
+            if auto_continue {
+                Git::commit_and_push(
                     &selected_service.source_root,
                     &commit_msg,
                     &yaml_path,
                     dry_run,
-                ) {
-                    println!("⚠️  Failed to commit/push changes: {}", e);
-                } else {
-                    if !dry_run {
-                        println!("✅ Changes committed and pushed to Git.");
-                    }
+                )?;
+                if !dry_run {
+                    println!("✅ Changes committed and pushed to Git.");
                 }
             } else {
-                println!("Committing skipped by user.");
+                if Confirm::new("Do you want to commit and push these changes?")
+                    .with_default(true)
+                    .prompt()?
+                {
+                    if let Err(e) = Git::commit_and_push(
+                        &selected_service.source_root,
+                        &commit_msg,
+                        &yaml_path,
+                        dry_run,
+                    ) {
+                        println!("⚠️  Failed to commit/push changes: {}", e);
+                    } else if !dry_run {
+                        println!("✅ Changes committed and pushed to Git.");
+                    }
+                } else {
+                    println!("Committing skipped by user.");
+                }
             }
         }
         Commands::Info {
