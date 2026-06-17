@@ -4,6 +4,13 @@ use std::process::Command;
 
 pub struct Git;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitPullReport {
+    pub stdout: String,
+    pub stderr: String,
+    pub success: bool,
+}
+
 pub struct GitLogEntry {
     pub hash: String,
     pub author: String,
@@ -25,24 +32,27 @@ impl Git {
     }
 
     /// Performs a git pull.
-    pub fn pull(path: &Path, dry_run: bool) -> Result<()> {
+    pub fn pull(path: &Path, dry_run: bool) -> Result<GitPullReport> {
         if dry_run {
-            println!("Dry-run: git -C {} pull", path.display());
-            return Ok(());
+            return Ok(GitPullReport {
+                stdout: format!("Dry-run: git -C {} pull\n", path.display()),
+                stderr: String::new(),
+                success: true,
+            });
         }
 
-        let status = Command::new("git")
+        let output = Command::new("git")
             .arg("-C")
             .arg(path)
             .arg("pull")
-            .status()
+            .output()
             .context("Failed to execute git pull")?;
 
-        if !status.success() {
-            return Err(anyhow::anyhow!("git pull failed"));
-        }
-
-        Ok(())
+        Ok(GitPullReport {
+            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            success: output.status.success(),
+        })
     }
 
     /// Gets the last commit that modified a specific file.

@@ -17,6 +17,10 @@ use registry::{ImageMetadata, Registry};
 use std::collections::HashSet;
 use std::fs;
 use std::process::Command;
+use std::sync::Arc;
+use std::thread;
+
+const MAX_PARALLEL_PULLS: usize = 5;
 
 #[derive(Parser)]
 #[command(name = "davit")]
@@ -460,12 +464,28 @@ fn pull_yaml_sources(env: &Environment, dry_run: bool, action: &str) -> Result<(
     }
 
     println!("🔄 Checking for updates in configured YAML sources...");
+    if sources.len() > 1 {
+        println!(
+            "Running up to {} git pulls in parallel and showing each repository output sequentially.",
+            MAX_PARALLEL_PULLS
+        );
+    }
 
     let mut failures = Vec::new();
-    for source in sources {
+    for (source, result) in collect_parallel_pull_results(&sources, MAX_PARALLEL_PULLS, move |source| {
+        Git::pull(&source.root, dry_run)
+    }) {
         println!("  - [{}] {}", source.name, source.root.display());
-        if let Err(e) = Git::pull(&source.root, dry_run) {
-            failures.push((source, e.to_string()));
+        match result {
+            Ok(report) => {
+                print_git_pull_report(&report.stdout, false);
+                print_git_pull_report(&report.stderr, true);
+
+                if !report.success {
+                    failures.push((source, "git pull failed".to_string()));
+                }
+            }
+            Err(error) => failures.push((source, error.to_string())),
         }
     }
 
@@ -489,6 +509,57 @@ fn pull_yaml_sources(env: &Environment, dry_run: bool, action: &str) -> Result<(
     }
 
     Ok(())
+}
+
+fn collect_parallel_pull_results<T, F>(
+    sources: &[YamlSource],
+    max_parallel: usize,
+    pull: F,
+) -> Vec<(YamlSource, Result<T>)>
+where
+    T: Send + 'static,
+    F: Fn(&YamlSource) -> Result<T> + Send + Sync + 'static,
+{
+    let max_parallel = max_parallel.max(1);
+    let pull = Arc::new(pull);
+    let mut results = Vec::with_capacity(sources.len());
+
+    for batch in sources.chunks(max_parallel) {
+        let mut handles = Vec::with_capacity(batch.len());
+
+        for source in batch {
+            let source = source.clone();
+            let pull = Arc::clone(&pull);
+            handles.push(thread::spawn(move || {
+                let result = pull(&source);
+                (source, result)
+            }));
+        }
+
+        for handle in handles {
+            results.push(handle.join().unwrap_or_else(|_| {
+                (
+                    YamlSource {
+                        name: "unknown".to_string(),
+                        root: std::path::PathBuf::new(),
+                    },
+                    Err(anyhow::anyhow!("git pull worker thread panicked")),
+                )
+            }));
+        }
+    }
+
+    results
+}
+
+fn print_git_pull_report(output: &str, is_stderr: bool) {
+    for line in output.lines() {
+        if is_stderr {
+            eprintln!("    {}", line);
+        } else {
+            println!("    {}", line);
+        }
+    }
 }
 
 fn unique_yaml_sources(env: &Environment) -> Vec<YamlSource> {
@@ -636,6 +707,8 @@ fn resolve_from_list(label: &str, items: &[String], input: String) -> Result<Str
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     #[test]
     fn test_service_display_name_unique() {
@@ -716,5 +789,61 @@ mod tests {
             get_service_display_name(&s2, &all),
             "service1 (ns1) [demo]/dir2/deploy.yaml"
         );
+    }
+
+    #[test]
+    fn test_collect_parallel_pull_results_preserves_source_order() {
+        let sources = vec![
+            YamlSource {
+                name: "one".to_string(),
+                root: PathBuf::from("/tmp/one"),
+            },
+            YamlSource {
+                name: "two".to_string(),
+                root: PathBuf::from("/tmp/two"),
+            },
+            YamlSource {
+                name: "three".to_string(),
+                root: PathBuf::from("/tmp/three"),
+            },
+        ];
+
+        let results = collect_parallel_pull_results(&sources, 2, |source| Ok(source.name.clone()));
+        let ordered_names: Vec<String> = results
+            .into_iter()
+            .map(|(source, result)| {
+                assert_eq!(result.as_ref().unwrap(), &source.name);
+                source.name
+            })
+            .collect();
+
+        assert_eq!(ordered_names, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn test_collect_parallel_pull_results_respects_parallel_limit() {
+        let sources: Vec<YamlSource> = (0..12)
+            .map(|idx| YamlSource {
+                name: format!("repo-{idx}"),
+                root: PathBuf::from(format!("/tmp/repo-{idx}")),
+            })
+            .collect();
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+
+        let active_for_pull = Arc::clone(&active);
+        let max_seen_for_pull = Arc::clone(&max_seen);
+
+        let results = collect_parallel_pull_results(&sources, 5, move |_source| {
+            let current = active_for_pull.fetch_add(1, Ordering::SeqCst) + 1;
+            max_seen_for_pull.fetch_max(current, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(20));
+            active_for_pull.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+        });
+
+        assert_eq!(results.len(), 12);
+        assert_eq!(max_seen.load(Ordering::SeqCst), 5);
     }
 }
