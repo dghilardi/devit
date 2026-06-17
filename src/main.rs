@@ -11,8 +11,9 @@ use chrono::Utc;
 use clap::{Parser, Subcommand};
 use config::{Config, Environment, ServiceSource, YamlSource};
 use crossterm::{
+    cursor::MoveToColumn,
     event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
 };
 use dashboard::{Dashboard, DashboardExit};
 use git::Git;
@@ -29,6 +30,7 @@ use std::time::{Duration, Instant};
 const MAX_PARALLEL_PULLS: usize = 5;
 const TAG_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const TAG_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const TAG_WAIT_CANCELLED_MESSAGE: &str = "__TAG_WAIT_CANCELLED__";
 
 #[derive(Parser)]
 #[command(name = "davit")]
@@ -116,7 +118,14 @@ async fn main() -> Result<()> {
             let selected_service = resolve_service(&selected_env, service)?;
 
             let selected_tag =
-                resolve_tag(&selected_env, &selected_service, tag, wait_for_tag)?;
+                match resolve_tag(&selected_env, &selected_service, tag, wait_for_tag) {
+                    Ok(tag) => tag,
+                    Err(err) if err.to_string() == TAG_WAIT_CANCELLED_MESSAGE => {
+                        println!("Tag wait cancelled. Deployment aborted.");
+                        return Ok(());
+                    }
+                    Err(err) => return Err(err),
+                };
 
             // 6.3 Production Protection
             if selected_env.protected.unwrap_or(false) {
@@ -608,7 +617,7 @@ fn resolve_tag(
     }
 
     if let Some(tag) = input {
-        let images = fetch_service_images(env, service)?;
+        let images = fetch_service_images(env, service, true)?;
         let available_tags = collect_available_tags(&images);
 
         if available_tags.is_empty() {
@@ -621,7 +630,7 @@ fn resolve_tag(
         return resolve_from_list("Image tag", &available_tags, tag);
     }
 
-    let images = fetch_service_images(env, service)?;
+    let images = fetch_service_images(env, service, true)?;
     let available_tags = collect_available_tags(&images);
 
     if available_tags.is_empty() {
@@ -656,13 +665,19 @@ fn resolve_tag(
     Ok(tag)
 }
 
-fn fetch_service_images(env: &Environment, service: &ServiceSource) -> Result<Vec<ImageMetadata>> {
+fn fetch_service_images(
+    env: &Environment,
+    service: &ServiceSource,
+    announce: bool,
+) -> Result<Vec<ImageMetadata>> {
     let project = env.gcp_project.as_deref().unwrap_or("MOCK_PROJECT");
 
-    println!(
-        "Fetching images for {} using path {}...",
-        service.name, service.image_path
-    );
+    if announce {
+        println!(
+            "Fetching images for {} using path {}...",
+            service.name, service.image_path
+        );
+    }
 
     let images = match Registry::fetch_images(&service.image_path) {
         Ok(imgs) => imgs,
@@ -696,11 +711,31 @@ fn collect_available_tags(images: &[ImageMetadata]) -> Vec<String> {
 fn wait_for_exact_tag(env: &Environment, service: &ServiceSource, tag: String) -> Result<String> {
     let mut attempt = 1;
 
+    println!(
+        "Waiting for image tag '{}' for service '{}'.",
+        tag, service.name
+    );
+    println!("Registry image: {}", service.image_path);
+    println!(
+        "Polling every {} seconds. Press 'q' to cancel.",
+        TAG_RETRY_INTERVAL.as_secs()
+    );
+
     loop {
-        let images = fetch_service_images(env, service)?;
+        render_tag_wait_status(
+            &tag,
+            &service.name,
+            attempt,
+            "Checking registry",
+            None,
+            '.',
+        )?;
+
+        let images = fetch_service_images(env, service, false)?;
         let available_tags = collect_available_tags(&images);
 
         if available_tags.iter().any(|available| available == &tag) {
+            clear_tag_wait_status_line()?;
             if attempt == 1 {
                 println!("Found image tag '{}'.", tag);
             } else {
@@ -733,16 +768,14 @@ fn wait_for_next_tag_check(service: &ServiceSource, tag: &str, attempt: usize) -
         let minutes = remaining / 60;
         let seconds = remaining % 60;
 
-        print!(
-            "\r{} Tag '{}' not found for {}. Check #{}. Retrying in {:02}:{:02}. Press 'q' to cancel.",
-            spinner[frame % spinner.len()],
+        render_tag_wait_status(
             tag,
-            service.name,
-            attempt + 1,
-            minutes,
-            seconds
-        );
-        io::stdout().flush()?;
+            &service.name,
+            attempt,
+            "Tag not available yet",
+            Some((minutes, seconds)),
+            spinner[frame % spinner.len()],
+        )?;
 
         if event::poll(TAG_WAIT_POLL_INTERVAL)? {
             loop {
@@ -751,11 +784,8 @@ fn wait_for_next_tag_check(service: &ServiceSource, tag: &str, attempt: usize) -
                 {
                     match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => {
-                            println!();
-                            return Err(anyhow::anyhow!(
-                                "Deployment aborted while waiting for image tag '{}'",
-                                tag
-                            ));
+                            clear_tag_wait_status_line()?;
+                            return Err(anyhow::anyhow!(TAG_WAIT_CANCELLED_MESSAGE));
                         }
                         _ => {}
                     }
@@ -770,11 +800,42 @@ fn wait_for_next_tag_check(service: &ServiceSource, tag: &str, attempt: usize) -
         frame += 1;
     }
 
-    println!();
-    println!(
-        "Rechecking registry for tag '{}' on service {}...",
-        tag, service.name
-    );
+    clear_tag_wait_status_line()?;
+    Ok(())
+}
+
+fn render_tag_wait_status(
+    tag: &str,
+    service_name: &str,
+    attempt: usize,
+    phase: &str,
+    remaining: Option<(u64, u64)>,
+    marker: char,
+) -> Result<()> {
+    clear_tag_wait_status_line()?;
+
+    match remaining {
+        Some((minutes, seconds)) => {
+            print!(
+                "{} {} for '{}' on {}. Checks: {}. Next check in {:02}:{:02}. Press 'q' to cancel.",
+                marker, phase, tag, service_name, attempt, minutes, seconds
+            );
+        }
+        None => {
+            print!(
+                "{} {} for '{}' on {}. Checks completed: {}. Press 'q' to cancel.",
+                marker, phase, tag, service_name, attempt.saturating_sub(1)
+            );
+        }
+    }
+
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn clear_tag_wait_status_line() -> Result<()> {
+    crossterm::execute!(io::stdout(), MoveToColumn(0), Clear(ClearType::CurrentLine))
+        .context("Failed to refresh tag wait status line")?;
     Ok(())
 }
 
