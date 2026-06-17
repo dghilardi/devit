@@ -10,17 +10,25 @@ use blueprint::Blueprint;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use config::{Config, Environment, ServiceSource, YamlSource};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    terminal::{disable_raw_mode, enable_raw_mode},
+};
 use dashboard::{Dashboard, DashboardExit};
 use git::Git;
 use inquire::{Confirm, Select, Text};
 use registry::{ImageMetadata, Registry};
 use std::collections::HashSet;
 use std::fs;
+use std::io::{self, Write};
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 const MAX_PARALLEL_PULLS: usize = 5;
+const TAG_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+const TAG_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Parser)]
 #[command(name = "davit")]
@@ -45,6 +53,10 @@ enum Commands {
         /// Image tag to deploy
         #[arg(short, long)]
         tag: Option<String>,
+
+        /// Wait until the provided image tag appears in the registry instead of prompting for similar tags
+        #[arg(long, conflicts_with = "tag", value_name = "TAG")]
+        wait_for_tag: Option<String>,
 
         /// Dry run: show commands without executing them
         #[arg(long)]
@@ -93,6 +105,7 @@ async fn main() -> Result<()> {
             env,
             service,
             tag,
+            wait_for_tag,
             dry_run,
             auto_continue,
         } => {
@@ -102,7 +115,8 @@ async fn main() -> Result<()> {
 
             let selected_service = resolve_service(&selected_env, service)?;
 
-            let selected_tag = resolve_tag(&selected_env, &selected_service, tag)?;
+            let selected_tag =
+                resolve_tag(&selected_env, &selected_service, tag, wait_for_tag)?;
 
             // 6.3 Production Protection
             if selected_env.protected.unwrap_or(false) {
@@ -587,7 +601,26 @@ fn resolve_tag(
     env: &Environment,
     service: &ServiceSource,
     input: Option<String>,
+    wait_for_tag: Option<String>,
 ) -> Result<String> {
+    if let Some(tag) = wait_for_tag {
+        return wait_for_exact_tag(env, service, tag);
+    }
+
+    if let Some(tag) = input {
+        let images = fetch_service_images(env, service)?;
+        let available_tags = collect_available_tags(&images);
+
+        if available_tags.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No images found for service {}",
+                service.name
+            ));
+        }
+
+        return resolve_from_list("Image tag", &available_tags, tag);
+    }
+
     let images = fetch_service_images(env, service)?;
     let available_tags = collect_available_tags(&images);
 
@@ -596,10 +629,6 @@ fn resolve_tag(
             "No images found for service {}",
             service.name
         ));
-    }
-
-    if let Some(tag) = input {
-        return resolve_from_list("Image tag", &available_tags, tag);
     }
 
     let options: Vec<String> = images
@@ -662,6 +691,106 @@ fn collect_available_tags(images: &[ImageMetadata]) -> Vec<String> {
     }
 
     tags
+}
+
+fn wait_for_exact_tag(env: &Environment, service: &ServiceSource, tag: String) -> Result<String> {
+    let mut attempt = 1;
+
+    loop {
+        let images = fetch_service_images(env, service)?;
+        let available_tags = collect_available_tags(&images);
+
+        if available_tags.iter().any(|available| available == &tag) {
+            if attempt == 1 {
+                println!("Found image tag '{}'.", tag);
+            } else {
+                println!(
+                    "Found image tag '{}' after {} checks. Continuing deployment.",
+                    tag, attempt
+                );
+            }
+            return Ok(tag);
+        }
+
+        wait_for_next_tag_check(service, &tag, attempt)?;
+        attempt += 1;
+    }
+}
+
+fn wait_for_next_tag_check(service: &ServiceSource, tag: &str, attempt: usize) -> Result<()> {
+    let _raw_mode = RawModeGuard::new()?;
+    let spinner = ['|', '/', '-', '\\'];
+    let start = Instant::now();
+    let mut frame = 0usize;
+
+    loop {
+        let elapsed = start.elapsed();
+        if elapsed >= TAG_RETRY_INTERVAL {
+            break;
+        }
+
+        let remaining = TAG_RETRY_INTERVAL.saturating_sub(elapsed).as_secs();
+        let minutes = remaining / 60;
+        let seconds = remaining % 60;
+
+        print!(
+            "\r{} Tag '{}' not found for {}. Check #{}. Retrying in {:02}:{:02}. Press 'q' to cancel.",
+            spinner[frame % spinner.len()],
+            tag,
+            service.name,
+            attempt + 1,
+            minutes,
+            seconds
+        );
+        io::stdout().flush()?;
+
+        if event::poll(TAG_WAIT_POLL_INTERVAL)? {
+            loop {
+                if let Event::Key(key) = event::read()?
+                    && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                {
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => {
+                            println!();
+                            return Err(anyhow::anyhow!(
+                                "Deployment aborted while waiting for image tag '{}'",
+                                tag
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+
+                if !event::poll(Duration::from_millis(0))? {
+                    break;
+                }
+            }
+        }
+
+        frame += 1;
+    }
+
+    println!();
+    println!(
+        "Rechecking registry for tag '{}' on service {}...",
+        tag, service.name
+    );
+    Ok(())
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode().context("Failed to enable terminal raw mode while waiting for image tag")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
 }
 
 fn mock_images() -> Vec<ImageMetadata> {
@@ -841,6 +970,25 @@ mod tests {
                 "v1.2.2".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn test_deploy_wait_for_tag_conflicts_with_tag() {
+        let parse = Cli::try_parse_from([
+            "davit",
+            "deploy",
+            "--tag",
+            "v1.2.3",
+            "--wait-for-tag",
+            "v1.2.4",
+        ]);
+        assert!(parse.is_err());
+    }
+
+    #[test]
+    fn test_deploy_wait_for_tag_accepts_value() {
+        let parse = Cli::try_parse_from(["davit", "deploy", "--wait-for-tag", "v1.2.3"]);
+        assert!(parse.is_ok());
     }
 
     #[test]
