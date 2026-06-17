@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Added validation for `davit deploy --tag` against the registry tag list, reusing the same similar-match confirmation and fallback selection flow used for services.
 - Updated multi-repo YAML source refresh to run `git pull` in parallel batches of up to five repositories while keeping each repository's output grouped and ordered.
 - Added a `deploy --auto-continue` mode that, after `kubectl apply`, keeps the rollout dashboard open until completion and then proceeds automatically through diff recap and Git push unless errors occur.
 - Added rollout completion detection to the post-release dashboard and a confirmation modal to either continue to the next step or keep monitoring.

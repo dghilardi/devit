@@ -102,11 +102,7 @@ async fn main() -> Result<()> {
 
             let selected_service = resolve_service(&selected_env, service)?;
 
-            let selected_tag = if let Some(t) = tag {
-                t
-            } else {
-                resolve_tag(&selected_env, &selected_service)?
-            };
+            let selected_tag = resolve_tag(&selected_env, &selected_service, tag)?;
 
             // 6.3 Production Protection
             if selected_env.protected.unwrap_or(false) {
@@ -587,30 +583,23 @@ fn capitalize_action(action: &str) -> String {
     }
 }
 
-fn resolve_tag(env: &Environment, service: &ServiceSource) -> Result<String> {
-    let project = env.gcp_project.as_deref().unwrap_or("MOCK_PROJECT");
+fn resolve_tag(
+    env: &Environment,
+    service: &ServiceSource,
+    input: Option<String>,
+) -> Result<String> {
+    let images = fetch_service_images(env, service)?;
+    let available_tags = collect_available_tags(&images);
 
-    println!(
-        "Fetching images for {} using path {}...",
-        service.name, service.image_path
-    );
-
-    let images = match Registry::fetch_images(&service.image_path) {
-        Ok(imgs) => imgs,
-        Err(e) => {
-            if project == "MOCK_PROJECT" {
-                mock_images()
-            } else {
-                return Err(e).context("Failed to fetch images from Artifact Registry");
-            }
-        }
-    };
-
-    if images.is_empty() {
+    if available_tags.is_empty() {
         return Err(anyhow::anyhow!(
             "No images found for service {}",
             service.name
         ));
+    }
+
+    if let Some(tag) = input {
+        return resolve_from_list("Image tag", &available_tags, tag);
     }
 
     let options: Vec<String> = images
@@ -636,6 +625,43 @@ fn resolve_tag(env: &Environment, service: &ServiceSource) -> Result<String> {
         .trim_end_matches(',')
         .to_string();
     Ok(tag)
+}
+
+fn fetch_service_images(env: &Environment, service: &ServiceSource) -> Result<Vec<ImageMetadata>> {
+    let project = env.gcp_project.as_deref().unwrap_or("MOCK_PROJECT");
+
+    println!(
+        "Fetching images for {} using path {}...",
+        service.name, service.image_path
+    );
+
+    let images = match Registry::fetch_images(&service.image_path) {
+        Ok(imgs) => imgs,
+        Err(e) => {
+            if project == "MOCK_PROJECT" {
+                mock_images()
+            } else {
+                return Err(e).context("Failed to fetch images from Artifact Registry");
+            }
+        }
+    };
+
+    Ok(images)
+}
+
+fn collect_available_tags(images: &[ImageMetadata]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut tags = Vec::new();
+
+    for image in images {
+        for tag in &image.tags {
+            if seen.insert(tag.clone()) {
+                tags.push(tag.clone());
+            }
+        }
+    }
+
+    tags
 }
 
 fn mock_images() -> Vec<ImageMetadata> {
@@ -788,6 +814,32 @@ mod tests {
         assert_eq!(
             get_service_display_name(&s2, &all),
             "service1 (ns1) [demo]/dir2/deploy.yaml"
+        );
+    }
+
+    #[test]
+    fn test_collect_available_tags_preserves_order_and_deduplicates() {
+        let now = Utc::now();
+        let images = vec![
+            ImageMetadata {
+                tags: vec!["v1.2.3".to_string(), "latest".to_string()],
+                update_time: now,
+                name: "service@sha256:abcdef1".to_string(),
+            },
+            ImageMetadata {
+                tags: vec!["latest".to_string(), "v1.2.2".to_string()],
+                update_time: now,
+                name: "service@sha256:abcdef2".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            collect_available_tags(&images),
+            vec![
+                "v1.2.3".to_string(),
+                "latest".to_string(),
+                "v1.2.2".to_string()
+            ]
         );
     }
 
