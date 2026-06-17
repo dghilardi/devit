@@ -63,6 +63,7 @@ pub struct Dashboard {
     log_tx: mpsc::UnboundedSender<LogLine>,
     completion_modal_visible: bool,
     completion_acknowledged: bool,
+    auto_close_on_rollout_complete: bool,
 }
 
 struct LogLine {
@@ -100,6 +101,7 @@ impl Dashboard {
         namespace: Option<String>,
         selector: Option<String>,
         container_name: String,
+        auto_close_on_rollout_complete: bool,
     ) -> Self {
         let (pod_tx, pod_rx) = mpsc::unbounded_channel();
         let (rollout_tx, rollout_rx) = mpsc::unbounded_channel();
@@ -126,6 +128,7 @@ impl Dashboard {
             log_tx,
             completion_modal_visible: false,
             completion_acknowledged: false,
+            auto_close_on_rollout_complete,
         }
     }
 
@@ -354,12 +357,24 @@ impl Dashboard {
                 }
                 self.pods = current_pods;
                 self.update_rollout_modal_state();
+                if self.auto_close_on_rollout_complete && self.is_rollout_complete() {
+                    terminal
+                        .draw(|f| self.ui(f))
+                        .map_err(|e| anyhow::anyhow!("Draw error: {}", e))?;
+                    return Ok(DashboardExit::RolloutCompleted);
+                }
                 needs_redraw = true;
             }
 
             while let Ok(rollout_status) = self.rollout_rx.try_recv() {
                 self.rollout_status = rollout_status;
                 self.update_rollout_modal_state();
+                if self.auto_close_on_rollout_complete && self.is_rollout_complete() {
+                    terminal
+                        .draw(|f| self.ui(f))
+                        .map_err(|e| anyhow::anyhow!("Draw error: {}", e))?;
+                    return Ok(DashboardExit::RolloutCompleted);
+                }
                 needs_redraw = true;
             }
 
