@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] 2026-06-17
+
 ### Changed
 - Added validation for provided deploy tags against the registry tag list, including a `--wait-for-tag <tag>` mode with cleaner live status feedback while polling for the exact tag before continuing.
 - Updated multi-repo YAML source refresh to run `git pull` in parallel batches of up to five repositories while keeping each repository's output grouped and ordered.
