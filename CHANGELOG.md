@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Added validation for provided deploy tags against the registry tag list, including a `--wait-for-tag <tag>` mode with cleaner live status feedback while polling for the exact tag before continuing.
 - Updated multi-repo YAML source refresh to run `git pull` in parallel batches of up to five repositories while keeping each repository's output grouped and ordered.
-- Added a `deploy --auto-continue` mode that, after `kubectl apply`, keeps the rollout dashboard open until completion and then proceeds automatically through diff recap and Git push unless errors occur.
+- Added `deploy --auto-continue` and `deploy --auto-apply` modes to continue automatically through rollout and Git steps, with `--auto-apply` also skipping the diff confirmation prompt after showing the pending change.
 - Added rollout completion detection to the post-release dashboard and a confirmation modal to either continue to the next step or keep monitoring.
 - Adjusted the post-release log dashboard so the pod status panel grows with the number of pods while keeping consistent minimum and maximum heights.
 

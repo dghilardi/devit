@@ -64,6 +64,10 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Apply the selected version immediately and continue automatically through rollout and Git steps
+        #[arg(long)]
+        auto_apply: bool,
+
         /// After `kubectl apply`, continue automatically through rollout completion and Git push unless errors occur
         #[arg(long)]
         auto_continue: bool,
@@ -109,8 +113,10 @@ async fn main() -> Result<()> {
             tag,
             wait_for_tag,
             dry_run,
+            auto_apply,
             auto_continue,
         } => {
+            let auto_continue = auto_continue || auto_apply;
             let selected_env = resolve_environment(&config, env)?;
 
             pull_yaml_sources(&selected_env, dry_run, "deployment")?;
@@ -169,6 +175,21 @@ async fn main() -> Result<()> {
 
             loop {
                 Blueprint::show_diff(&original_content, &updated_content, filename, show_unified);
+
+                if auto_apply {
+                    if dry_run {
+                        println!(
+                            "Dry-run: would write updated YAML to {}",
+                            yaml_path.display()
+                        );
+                    } else {
+                        fs::write(&yaml_path, &updated_content).with_context(|| {
+                            format!("Failed to write updated YAML to {}", yaml_path.display())
+                        })?;
+                    }
+                    println!("Auto-apply enabled. Local YAML updated. Executing kubectl apply...");
+                    break;
+                }
 
                 let choices = if show_unified {
                     vec!["Apply", "Show full diff", "Dismiss"]
@@ -1049,6 +1070,12 @@ mod tests {
     #[test]
     fn test_deploy_wait_for_tag_accepts_value() {
         let parse = Cli::try_parse_from(["davit", "deploy", "--wait-for-tag", "v1.2.3"]);
+        assert!(parse.is_ok());
+    }
+
+    #[test]
+    fn test_deploy_auto_apply_accepts_flag() {
+        let parse = Cli::try_parse_from(["davit", "deploy", "--auto-apply"]);
         assert!(parse.is_ok());
     }
 
