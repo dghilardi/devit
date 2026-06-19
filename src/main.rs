@@ -13,7 +13,7 @@ use config::{Config, Environment, ServiceSource, YamlSource};
 use crossterm::{
     cursor::MoveToColumn,
     event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
 };
 use dashboard::{Dashboard, DashboardExit};
 use git::Git;
@@ -826,8 +826,8 @@ fn wait_for_next_tag_check(service: &ServiceSource, tag: &str, attempt: usize) -
 }
 
 fn render_tag_wait_status(
-    tag: &str,
-    service_name: &str,
+    _tag: &str,
+    _service_name: &str,
     attempt: usize,
     phase: &str,
     remaining: Option<(u64, u64)>,
@@ -835,29 +835,59 @@ fn render_tag_wait_status(
 ) -> Result<()> {
     clear_tag_wait_status_line()?;
 
-    match remaining {
+    let status = match remaining {
         Some((minutes, seconds)) => {
-            print!(
-                "{} {} for '{}' on {}. Checks: {}. Next check in {:02}:{:02}. Press 'q' to cancel.",
-                marker, phase, tag, service_name, attempt, minutes, seconds
-            );
+            format!(
+                "{} {} | check {} | next {:02}:{:02} | q cancel",
+                marker, phase, attempt, minutes, seconds
+            )
         }
         None => {
-            print!(
-                "{} {} for '{}' on {}. Checks completed: {}. Press 'q' to cancel.",
-                marker, phase, tag, service_name, attempt.saturating_sub(1)
-            );
+            format!(
+                "{} {} | completed {} | q cancel",
+                marker,
+                phase,
+                attempt.saturating_sub(1)
+            )
         }
-    }
+    };
+
+    let terminal_width = terminal_size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(120);
+    print!("{}", truncate_for_terminal_width(&status, terminal_width));
 
     io::stdout().flush()?;
     Ok(())
 }
 
 fn clear_tag_wait_status_line() -> Result<()> {
-    crossterm::execute!(io::stdout(), MoveToColumn(0), Clear(ClearType::CurrentLine))
+    crossterm::execute!(io::stdout(), MoveToColumn(0), Clear(ClearType::FromCursorDown))
         .context("Failed to refresh tag wait status line")?;
     Ok(())
+}
+
+fn truncate_for_terminal_width(input: &str, width: usize) -> String {
+    let safe_width = width.saturating_sub(1);
+    let char_count = input.chars().count();
+    if char_count <= safe_width {
+        return input.to_string();
+    }
+
+    if safe_width == 0 {
+        return String::new();
+    }
+
+    if safe_width <= 3 {
+        return ".".repeat(safe_width);
+    }
+
+    let mut truncated = String::new();
+    for ch in input.chars().take(safe_width - 3) {
+        truncated.push(ch);
+    }
+    truncated.push_str("...");
+    truncated
 }
 
 struct RawModeGuard;
@@ -1077,6 +1107,29 @@ mod tests {
     fn test_deploy_auto_apply_accepts_flag() {
         let parse = Cli::try_parse_from(["davit", "deploy", "--auto-apply"]);
         assert!(parse.is_ok());
+    }
+
+    #[test]
+    fn test_truncate_for_terminal_width_truncates_with_ellipsis() {
+        assert_eq!(
+            truncate_for_terminal_width("1234567890", 8),
+            "1234...".to_string()
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_terminal_width_keeps_short_message() {
+        assert_eq!(
+            truncate_for_terminal_width("short", 10),
+            "short".to_string()
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_terminal_width_reserves_last_terminal_column() {
+        let rendered = truncate_for_terminal_width("1234567890", 10);
+        assert_eq!(rendered.chars().count(), 9);
+        assert_eq!(rendered, "123456...".to_string());
     }
 
     #[test]
