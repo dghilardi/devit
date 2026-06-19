@@ -22,6 +22,7 @@ use registry::{ImageMetadata, Registry};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
@@ -31,6 +32,14 @@ const MAX_PARALLEL_PULLS: usize = 5;
 const TAG_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const TAG_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TAG_WAIT_CANCELLED_MESSAGE: &str = "__TAG_WAIT_CANCELLED__";
+
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteManifestDiffCheck {
+    InSync,
+    Drift(String),
+    CheckFailed(String),
+    SkippedDryRun,
+}
 
 #[derive(Parser)]
 #[command(name = "davit")]
@@ -122,6 +131,16 @@ async fn main() -> Result<()> {
             pull_yaml_sources(&selected_env, dry_run, "deployment")?;
 
             let selected_service = resolve_service(&selected_env, service)?;
+
+            let remote_diff = check_remote_manifest_diff(
+                &selected_env.kubectl_context,
+                &selected_service.yaml_path,
+                dry_run,
+            )?;
+            if !confirm_remote_manifest_diff(&selected_service.yaml_path, remote_diff)? {
+                println!("Deployment cancelled. No changes made.");
+                return Ok(());
+            }
 
             let selected_tag =
                 match resolve_tag(&selected_env, &selected_service, tag, wait_for_tag) {
@@ -627,6 +646,114 @@ fn capitalize_action(action: &str) -> String {
     }
 }
 
+fn check_remote_manifest_diff(
+    kubectl_context: &str,
+    yaml_path: &Path,
+    dry_run: bool,
+) -> Result<RemoteManifestDiffCheck> {
+    if dry_run {
+        println!(
+            "Dry-run: kubectl --context {} diff -f {}",
+            kubectl_context,
+            yaml_path.display()
+        );
+        return Ok(RemoteManifestDiffCheck::SkippedDryRun);
+    }
+
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            kubectl_context,
+            "diff",
+            "-f",
+            yaml_path.to_str().unwrap(),
+        ])
+        .output()
+        .context("Failed to execute kubectl diff")?;
+
+    Ok(classify_kubectl_diff_result(
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    ))
+}
+
+fn classify_kubectl_diff_result(
+    status_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> RemoteManifestDiffCheck {
+    let output = combine_command_output(stdout, stderr);
+
+    match status_code {
+        Some(0) => RemoteManifestDiffCheck::InSync,
+        Some(1) => RemoteManifestDiffCheck::Drift(output),
+        Some(code) => RemoteManifestDiffCheck::CheckFailed(format!(
+            "kubectl diff exited with status {}.\n{}",
+            code,
+            fallback_command_output(output)
+        )),
+        None => RemoteManifestDiffCheck::CheckFailed(format!(
+            "kubectl diff terminated without an exit status.\n{}",
+            fallback_command_output(output)
+        )),
+    }
+}
+
+fn combine_command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("{}\n{}", stdout, stderr),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (true, true) => String::new(),
+    }
+}
+
+fn fallback_command_output(output: String) -> String {
+    if output.is_empty() {
+        "No output returned by kubectl diff.".to_string()
+    } else {
+        output
+    }
+}
+
+fn confirm_remote_manifest_diff(
+    yaml_path: &Path,
+    diff_check: RemoteManifestDiffCheck,
+) -> Result<bool> {
+    match diff_check {
+        RemoteManifestDiffCheck::InSync | RemoteManifestDiffCheck::SkippedDryRun => Ok(true),
+        RemoteManifestDiffCheck::Drift(diff) => {
+            println!(
+                "\n⚠️  Remote cluster state is not aligned with {}.",
+                yaml_path.display()
+            );
+            if diff.is_empty() {
+                println!("kubectl diff detected changes but did not return a diff body.");
+            } else {
+                println!("{}", diff);
+            }
+
+            Confirm::new("Do you want to continue with deployment despite this drift?")
+                .with_default(false)
+                .prompt()
+                .map_err(Into::into)
+        }
+        RemoteManifestDiffCheck::CheckFailed(message) => {
+            println!("\n⚠️  Could not verify remote manifest alignment.");
+            println!("{}", message);
+
+            Confirm::new("Do you want to continue without the remote alignment check?")
+                .with_default(false)
+                .prompt()
+                .map_err(Into::into)
+        }
+    }
+}
+
 fn resolve_tag(
     env: &Environment,
     service: &ServiceSource,
@@ -1107,6 +1234,43 @@ mod tests {
     fn test_deploy_auto_apply_accepts_flag() {
         let parse = Cli::try_parse_from(["davit", "deploy", "--auto-apply"]);
         assert!(parse.is_ok());
+    }
+
+    #[test]
+    fn test_classify_kubectl_diff_result_in_sync() {
+        assert_eq!(
+            classify_kubectl_diff_result(Some(0), b"", b""),
+            RemoteManifestDiffCheck::InSync
+        );
+    }
+
+    #[test]
+    fn test_classify_kubectl_diff_result_detects_drift() {
+        assert_eq!(
+            classify_kubectl_diff_result(Some(1), b"diff body\n", b""),
+            RemoteManifestDiffCheck::Drift("diff body".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_kubectl_diff_result_combines_stdout_and_stderr_on_failure() {
+        assert_eq!(
+            classify_kubectl_diff_result(Some(2), b"stdout\n", b"stderr\n"),
+            RemoteManifestDiffCheck::CheckFailed(
+                "kubectl diff exited with status 2.\nstdout\nstderr".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_classify_kubectl_diff_result_handles_missing_output() {
+        assert_eq!(
+            classify_kubectl_diff_result(Some(3), b"", b""),
+            RemoteManifestDiffCheck::CheckFailed(
+                "kubectl diff exited with status 3.\nNo output returned by kubectl diff."
+                    .to_string()
+            )
+        );
     }
 
     #[test]

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Added a pre-apply remote alignment check during `deploy` using `kubectl diff`, warning with the live diff and asking for confirmation before continuing when the selected manifest has drifted from the cluster.
+
 ## [0.3.0] 2026-06-17
 
 ### Changed
