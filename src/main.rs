@@ -38,6 +38,10 @@ const TAG_WAIT_CANCELLED_MESSAGE: &str = "__TAG_WAIT_CANCELLED__";
 /// in `--namespace` alike, so the listing round-trips. A lone `-` cannot
 /// collide with a real namespace: those must start and end alphanumerically.
 const NO_NAMESPACE: &str = "-";
+/// Caps the SERVICE column. A name disambiguated all the way down to its
+/// manifest path can run past 100 characters, and padding every other row to
+/// match makes the listing unreadable.
+const MAX_SERVICE_COLUMN: usize = 48;
 
 #[derive(Debug, PartialEq, Eq)]
 enum RemoteManifestDiffCheck {
@@ -49,6 +53,7 @@ enum RemoteManifestDiffCheck {
 
 #[derive(Parser)]
 #[command(name = "davit")]
+#[command(version)]
 #[command(about = "A safe Kubernetes deployment wrapper & TUI", long_about = None)]
 struct Cli {
     /// Never prompt; fail instead, naming the decision that would have been asked
@@ -635,12 +640,7 @@ fn print_service_list(services: &[ServiceSource]) {
         .map(|service| (get_service_display_name(service, services), service))
         .collect();
 
-    let name_width = rows
-        .iter()
-        .map(|(name, _)| name.chars().count())
-        .chain(std::iter::once("SERVICE".len()))
-        .max()
-        .unwrap_or_default();
+    let name_width = service_column_width(&rows);
     let namespace_width = rows
         .iter()
         .map(|(_, service)| namespace_label(service).chars().count())
@@ -662,6 +662,30 @@ fn print_service_list(services: &[ServiceSource]) {
             get_service_source_display_path(service)
         );
     }
+}
+
+/// Indefinite article for a label, so an error reads "an image tag", not
+/// "a image tag". A leading-vowel test is enough for the labels in use
+/// (environment, service, image tag) and for anything similar.
+fn article_for(noun: &str) -> &'static str {
+    match noun.chars().next() {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => "an",
+        _ => "a",
+    }
+}
+
+/// Width of the SERVICE column: the widest name that still fits the cap.
+///
+/// Names past the cap overflow their own row instead of widening every other
+/// one. They are never truncated: the value has to stay copy-pasteable into
+/// `--service`, which is the whole point of the listing.
+fn service_column_width<T>(rows: &[(String, T)]) -> usize {
+    rows.iter()
+        .map(|(name, _)| name.chars().count())
+        .chain(std::iter::once("SERVICE".len()))
+        .filter(|width| *width <= MAX_SERVICE_COLUMN)
+        .max()
+        .unwrap_or(MAX_SERVICE_COLUMN)
 }
 
 /// The namespace as the manifest declares it; `--namespace` matches this value.
@@ -1387,7 +1411,7 @@ fn resolve_from_list(
     // 2. Partial matches
     let matches: Vec<&String> = items.iter().filter(|&i| i.contains(&input)).collect();
     let noun = label.to_lowercase();
-    let decision = format!("a {}", noun);
+    let decision = format!("{} {}", article_for(&noun), noun);
 
     match matches.len() {
         0 => {
@@ -1588,6 +1612,20 @@ mod tests {
     /// Non-interactive resolution never falls through to a prompt, and says why.
     fn blocked() -> PromptPolicy {
         PromptPolicy::new(true, true)
+    }
+
+    #[test]
+    fn test_decision_labels_read_grammatically() {
+        assert_eq!(article_for("environment"), "an");
+        assert_eq!(article_for("image tag"), "an");
+        assert_eq!(article_for("service"), "a");
+
+        // The label reaches the user inside the error, so check it end to end.
+        let items = vec!["v1.2.3".to_string(), "v1.2.4".to_string()];
+        let err = resolve_from_list("Image tag", &items, "v1.2".to_string(), blocked())
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("Cannot ask for an image tag:"), "{err}");
     }
 
     #[test]
@@ -1818,6 +1856,53 @@ mod tests {
                 "{value} with --namespace {namespace:?}"
             );
         }
+    }
+
+    /// Rows are (display name, anything); the payload is irrelevant to the width.
+    fn named(names: &[&str]) -> Vec<(String, ())> {
+        names.iter().map(|n| ((*n).to_string(), ())).collect()
+    }
+
+    #[test]
+    fn test_service_column_fits_the_widest_name() {
+        assert_eq!(
+            service_column_width(&named(&["billing", "svc-api (tenant-b)"])),
+            18
+        );
+    }
+
+    #[test]
+    fn test_service_column_never_shrinks_below_its_header() {
+        assert_eq!(service_column_width(&named(&["a", "bc"])), "SERVICE".len());
+        assert_eq!(service_column_width::<()>(&[]), "SERVICE".len());
+    }
+
+    #[test]
+    fn test_service_column_ignores_names_past_the_cap() {
+        let outlier = "x".repeat(MAX_SERVICE_COLUMN + 60);
+        let width = service_column_width(&named(&["svc-api (tenant-b)", &outlier]));
+
+        // The outlier overflows its own row rather than padding every other one.
+        assert_eq!(width, 18);
+    }
+
+    #[test]
+    fn test_service_column_falls_back_to_the_cap_when_all_names_overflow() {
+        let long = "x".repeat(MAX_SERVICE_COLUMN + 1);
+        assert_eq!(
+            service_column_width(&named(&[&long, &long])),
+            "SERVICE".len()
+        );
+    }
+
+    #[test]
+    fn test_version_flag_is_available() {
+        // `Cli` is not Debug, so unwrap_err() is not available here.
+        let Err(err) = Cli::try_parse_from(["davit", "--version"]) else {
+            panic!("--version should short-circuit parsing");
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(err.to_string().contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]

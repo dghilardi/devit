@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added `davit --version`.
+
+### Fixed
+- `list services` no longer pads every row to the width of the longest fully-qualified service name, which made the listing unreadable on environments with many services. Names past the cap overflow their own row instead, and are never truncated.
+- Non-interactive errors now read "Cannot ask for an image tag" rather than "a image tag".
+
 ## [0.4.0] 2026-09-19
 
 ### Added
