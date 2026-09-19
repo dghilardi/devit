@@ -67,6 +67,10 @@ enum Commands {
         #[arg(short, long)]
         service: Option<String>,
 
+        /// Kubernetes namespace, to disambiguate a service name declared in several namespaces
+        #[arg(short, long)]
+        namespace: Option<String>,
+
         /// Image tag to deploy
         #[arg(short, long)]
         tag: Option<String>,
@@ -105,10 +109,31 @@ enum Commands {
         #[arg(short, long)]
         service: Option<String>,
     },
+    /// List the identifiers accepted by --env and --service
+    List {
+        #[command(subcommand)]
+        command: ListCommands,
+    },
     /// Configuration management
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ListCommands {
+    /// List the configured environments
+    Envs,
+    /// List the services discovered in an environment's YAML sources
+    Services {
+        /// Target environment (e.g., staging, production)
+        #[arg(short, long)]
+        env: Option<String>,
+
+        /// Only list services declared in this namespace
+        #[arg(short, long)]
+        namespace: Option<String>,
     },
 }
 
@@ -130,6 +155,7 @@ async fn main() -> Result<()> {
         Commands::Deploy {
             env,
             service,
+            namespace,
             tag,
             wait_for_tag,
             dry_run,
@@ -142,7 +168,8 @@ async fn main() -> Result<()> {
 
             pull_yaml_sources(&selected_env, dry_run, "deployment", policy)?;
 
-            let selected_service = resolve_service(&selected_env, service, policy)?;
+            let selected_service =
+                resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
 
             let remote_diff = check_remote_manifest_diff(
                 &selected_env.kubectl_context,
@@ -372,6 +399,27 @@ async fn main() -> Result<()> {
                 resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
             info::show_info(&selected_env, &selected_service).await?;
         }
+        Commands::List { command } => match command {
+            ListCommands::Envs => {
+                for environment in &config.environments {
+                    let protected = if environment.protected.unwrap_or(false) {
+                        "  (protected)"
+                    } else {
+                        ""
+                    };
+                    println!("{}{}", environment.name, protected);
+                }
+            }
+            ListCommands::Services { env, namespace } => {
+                let selected_env = resolve_environment(&config, env, policy)?;
+
+                pull_yaml_sources(&selected_env, false, "listing", policy)?;
+
+                let services =
+                    list_services_in_namespace(&selected_env, namespace.as_deref())?;
+                print_service_list(&services);
+            }
+        },
         Commands::Config { command } => match command {
             ConfigCommands::Show => {
                 println!("{:#?}", config);
@@ -452,30 +500,21 @@ fn get_service_display_name(
     )
 }
 
-fn resolve_service(
+/// Lists services in a stable order, optionally narrowed to one namespace.
+///
+/// The order matters beyond presentation: it fixes the order of the candidate
+/// lists reported when a selection cannot be made, and of the prompt itself.
+fn list_services_in_namespace(
     env: &Environment,
-    input: Option<String>,
-    policy: PromptPolicy,
-) -> Result<ServiceSource> {
-    let services = env
-        .list_services()
-        .context("Failed to list services in repo_root")?;
-    resolve_service_from_list(services, env, input, policy)
-}
-
-fn resolve_service_with_ns_filter(
-    env: &Environment,
-    input: Option<String>,
-    namespace: Option<String>,
-    policy: PromptPolicy,
-) -> Result<ServiceSource> {
+    namespace: Option<&str>,
+) -> Result<Vec<ServiceSource>> {
     let all_services = env.list_services().context("Failed to list services")?;
 
-    let services = match namespace {
-        Some(ref ns) => {
+    let mut services = match namespace {
+        Some(ns) => {
             let filtered: Vec<ServiceSource> = all_services
                 .into_iter()
-                .filter(|s| s.namespace.as_deref() == Some(ns.as_str()))
+                .filter(|s| s.namespace.as_deref() == Some(ns))
                 .collect();
             if filtered.is_empty() {
                 return Err(anyhow::anyhow!("No services found in namespace '{}'", ns));
@@ -485,6 +524,23 @@ fn resolve_service_with_ns_filter(
         None => all_services,
     };
 
+    services.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.namespace.cmp(&b.namespace))
+            .then_with(|| a.yaml_path.cmp(&b.yaml_path))
+    });
+
+    Ok(services)
+}
+
+fn resolve_service_with_ns_filter(
+    env: &Environment,
+    input: Option<String>,
+    namespace: Option<String>,
+    policy: PromptPolicy,
+) -> Result<ServiceSource> {
+    let services = list_services_in_namespace(env, namespace.as_deref())?;
     resolve_service_from_list(services, env, input, policy)
 }
 
@@ -527,6 +583,47 @@ fn resolve_service_from_list(
         .find(|(n, _)| n == &selected_name)
         .map(|(_, s)| s)
         .context("Resolved service not found in list")
+}
+
+/// Prints the values `--service` accepts, alongside what each one resolves to.
+fn print_service_list(services: &[ServiceSource]) {
+    let rows: Vec<(String, &ServiceSource)> = services
+        .iter()
+        .map(|service| (get_service_display_name(service, services), service))
+        .collect();
+
+    let name_width = rows
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .chain(std::iter::once("SERVICE".len()))
+        .max()
+        .unwrap_or_default();
+    let namespace_width = rows
+        .iter()
+        .map(|(_, service)| namespace_label(service).chars().count())
+        .chain(std::iter::once("NAMESPACE".len()))
+        .max()
+        .unwrap_or_default();
+
+    println!(
+        "{:<name_width$}  {:<namespace_width$}  {:<12}  MANIFEST",
+        "SERVICE", "NAMESPACE", "KIND"
+    );
+
+    for (name, service) in &rows {
+        println!(
+            "{:<name_width$}  {:<namespace_width$}  {:<12}  {}",
+            name,
+            namespace_label(service),
+            service.kind,
+            get_service_source_display_path(service)
+        );
+    }
+}
+
+/// The namespace as the manifest declares it; `--namespace` matches this value.
+fn namespace_label(service: &ServiceSource) -> &str {
+    service.namespace.as_deref().unwrap_or("-")
 }
 
 fn get_service_source_display_path(service: &ServiceSource) -> String {
@@ -1502,6 +1599,103 @@ mod tests {
             .to_string();
 
         assert!(err.contains("Pass --confirm-env production"), "{err}");
+    }
+
+    /// A manifest per entry, so the environment sees colliding service names.
+    fn env_with_manifests(dir: &std::path::Path, manifests: &[(&str, &str)]) -> Environment {
+        for (file, body) in manifests {
+            std::fs::write(dir.join(file), body).unwrap();
+        }
+
+        Environment {
+            name: "preprod".to_string(),
+            env_yaml_dir: dir.to_path_buf(),
+            env_yaml_dir_extra: Default::default(),
+            kubectl_context: "ctx".to_string(),
+            gcp_project: None,
+            protected: None,
+        }
+    }
+
+    fn manifest(name: &str, namespace: Option<&str>) -> String {
+        let namespace = namespace
+            .map(|ns| format!("\n  namespace: {ns}"))
+            .unwrap_or_default();
+        format!(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {name}{namespace}\nspec:\n  template:\n    spec:\n      containers:\n      - name: {name}\n        image: gcr.io/p/{name}:v1\n"
+        )
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_is_ordered_by_name_then_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(
+            dir.path(),
+            &[
+                ("c.yml", &manifest("svc-api", Some("tenant-b"))),
+                ("a.yml", &manifest("billing", Some("core"))),
+                ("b.yml", &manifest("svc-api", None)),
+            ],
+        );
+
+        let services = list_services_in_namespace(&env, None).unwrap();
+        let ordered: Vec<(&str, Option<&str>)> = services
+            .iter()
+            .map(|s| (s.name.as_str(), s.namespace.as_deref()))
+            .collect();
+
+        assert_eq!(
+            ordered,
+            vec![
+                ("billing", Some("core")),
+                ("svc-api", None),
+                ("svc-api", Some("tenant-b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_filters_and_disambiguates() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(
+            dir.path(),
+            &[
+                ("a.yml", &manifest("svc-api", Some("tenant-b"))),
+                ("b.yml", &manifest("svc-api", None)),
+            ],
+        );
+
+        let services = list_services_in_namespace(&env, Some("tenant-b")).unwrap();
+        assert_eq!(services.len(), 1);
+        // Once narrowed the name no longer collides, so --service takes it plain.
+        assert_eq!(
+            get_service_display_name(&services[0], &services),
+            "svc-api"
+        );
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_rejects_an_empty_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(dir.path(), &[("a.yml", &manifest("billing", Some("core")))]);
+
+        let err = list_services_in_namespace(&env, Some("absent"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No services found in namespace 'absent'"), "{err}");
+    }
+
+    #[test]
+    fn test_deploy_accepts_a_namespace() {
+        let parse =
+            Cli::try_parse_from(["davit", "deploy", "--service", "svc-api", "--namespace", "tenant-b"]);
+        assert!(parse.is_ok());
+    }
+
+    #[test]
+    fn test_list_subcommands_parse() {
+        assert!(Cli::try_parse_from(["davit", "list", "envs"]).is_ok());
+        assert!(Cli::try_parse_from(["davit", "list", "services", "--env", "preprod"]).is_ok());
     }
 
     #[test]
