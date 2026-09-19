@@ -7,19 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- `deploy --dry-run` no longer reaches any interactive prompt: the protected-environment confirmation, the diff approval, the rollout dashboard and the commit confirmation are all skipped, so a dry run now completes without a terminal.
-
 ### Added
-- Added `--no-fetch` to `deploy`, `info` and `list services`, so a query can read the manifests as they are on disk instead of running `git pull` across every configured YAML source first.
-- Added `davit list envs` and `davit list services`, so the exact values accepted by `--env` and `--service` can be discovered instead of guessed. Services are now listed in a stable order.
-- Added `deploy --namespace`, matching the option `info` already had, so a service name declared in several namespaces can be selected without passing a rendered display name. `--namespace -` selects the manifests that declare no namespace, mirroring the `-` shown in the listing.
 - Added a global `--non-interactive` flag, also inferred when stdin is not a terminal, that never prompts and instead fails naming the decision it could not ask and the valid values to supply. Ambiguous `--service`, `--env` and `--tag` values now list their candidates instead of surfacing `The input device is not a TTY`.
+- Added `davit list envs` and `davit list services`, so the exact values accepted by `--env` and `--service` can be discovered instead of guessed. Services are now listed in a stable order.
+- Added `deploy --namespace`, matching the option `info` already had, so a service name declared in several namespaces can be selected without passing a rendered display name. `--namespace -` selects the manifests that declare no namespace, mirroring the `-` shown in the listing, and a listed name can be passed with or without its namespace suffix.
 - Added `deploy --confirm-env <NAME>`, the explicit opt-in that replaces the typed confirmation when deploying to a protected environment without a terminal.
+- Added `--no-fetch` to `deploy`, `info` and `list services`, so a query can read the manifests as they are on disk instead of running `git pull` across every configured YAML source first.
 
 ### Changed
 - YAML sources with uncommitted changes are no longer pulled: the refresh reports them as skipped and leaves the working copy alone, instead of turning a read into a merge.
 - Added a pre-apply remote alignment check during `deploy` using `kubectl diff`, warning with the live diff and asking for confirmation before continuing when the selected manifest has drifted from the cluster.
+
+### Fixed
+- `deploy --dry-run` no longer reaches any interactive prompt: the protected-environment confirmation, the diff approval, the rollout dashboard and the commit confirmation are all skipped, so a dry run now completes without a terminal.
 
 ## [0.3.0] 2026-06-17
 
