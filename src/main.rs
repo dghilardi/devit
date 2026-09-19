@@ -87,7 +87,6 @@ enum Commands {
         #[arg(long)]
         no_fetch: bool,
 
-
         /// Apply the selected version immediately and continue automatically through rollout and Git steps
         #[arg(long)]
         auto_apply: bool,
@@ -434,8 +433,7 @@ async fn main() -> Result<()> {
 
                 pull_yaml_sources(&selected_env, false, no_fetch, "listing", policy)?;
 
-                let services =
-                    list_services_in_namespace(&selected_env, namespace.as_deref())?;
+                let services = list_services_in_namespace(&selected_env, namespace.as_deref())?;
                 print_service_list(&services);
             }
         },
@@ -466,10 +464,7 @@ fn resolve_environment(
             "an environment",
             "Select Environment:",
             env_names.clone(),
-            &format!(
-                "Pass --env with one of:\n{}",
-                format_candidates(&env_names)
-            ),
+            &format!("Pass --env with one of:\n{}", format_candidates(&env_names)),
         )?,
     };
 
@@ -678,9 +673,11 @@ fn pull_yaml_sources(
     }
 
     let mut failures = Vec::new();
-    for (source, result) in collect_parallel_pull_results(&sources, MAX_PARALLEL_PULLS, move |source| {
-        pull_source(source, dry_run)
-    }) {
+    for (source, result) in
+        collect_parallel_pull_results(&sources, MAX_PARALLEL_PULLS, move |source| {
+            pull_source(source, dry_run)
+        })
+    {
         println!("  - [{}] {}", source.name, source.root.display());
         match result {
             Ok(report) => {
@@ -705,7 +702,10 @@ fn pull_yaml_sources(
     }
 
     if !policy.confirm(
-        &format!("approval to continue with {} after a failed git pull", action),
+        &format!(
+            "approval to continue with {} after a failed git pull",
+            action
+        ),
         &format!("Do you want to continue with {} anyway?", action),
         false,
         "Fix the YAML sources listed above before retrying.",
@@ -1141,14 +1141,7 @@ fn wait_for_exact_tag(
 
     loop {
         if policy.is_interactive() {
-            render_tag_wait_status(
-                &tag,
-                &service.name,
-                attempt,
-                "Checking registry",
-                None,
-                '.',
-            )?;
+            render_tag_wait_status(&tag, &service.name, attempt, "Checking registry", None, '.')?;
         }
 
         let images = fetch_service_images(env, service, false)?;
@@ -1710,10 +1703,7 @@ mod tests {
         let services = list_services_in_namespace(&env, Some("tenant-b")).unwrap();
         assert_eq!(services.len(), 1);
         // Once narrowed the name no longer collides, so --service takes it plain.
-        assert_eq!(
-            get_service_display_name(&services[0], &services),
-            "svc-api"
-        );
+        assert_eq!(get_service_display_name(&services[0], &services), "svc-api");
     }
 
     #[test]
@@ -1724,7 +1714,10 @@ mod tests {
         let err = list_services_in_namespace(&env, Some("absent"))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("No services found in namespace 'absent'"), "{err}");
+        assert!(
+            err.contains("No services found in namespace 'absent'"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1790,8 +1783,14 @@ mod tests {
 
     #[test]
     fn test_deploy_accepts_a_namespace() {
-        let parse =
-            Cli::try_parse_from(["davit", "deploy", "--service", "svc-api", "--namespace", "tenant-b"]);
+        let parse = Cli::try_parse_from([
+            "davit",
+            "deploy",
+            "--service",
+            "svc-api",
+            "--namespace",
+            "tenant-b",
+        ]);
         assert!(parse.is_ok());
     }
 

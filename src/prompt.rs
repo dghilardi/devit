@@ -157,7 +157,12 @@ mod tests {
     #[test]
     fn test_select_fails_without_prompting() {
         let err = PromptPolicy::new(true, true)
-            .select("a service", "Select:", vec!["a".to_string()], "Pass --service.")
+            .select(
+                "a service",
+                "Select:",
+                vec!["a".to_string()],
+                "Pass --service.",
+            )
             .unwrap_err();
         assert!(err.to_string().contains("Cannot ask for a service"));
     }
