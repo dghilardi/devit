@@ -17,7 +17,7 @@ use crossterm::{
     terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
 };
 use dashboard::{Dashboard, DashboardExit};
-use git::Git;
+use git::{Git, GitPullReport};
 use inquire::{Confirm, Select, Text};
 use prompt::{PromptPolicy, format_candidates};
 use registry::{ImageMetadata, Registry};
@@ -679,7 +679,7 @@ fn pull_yaml_sources(
 
     let mut failures = Vec::new();
     for (source, result) in collect_parallel_pull_results(&sources, MAX_PARALLEL_PULLS, move |source| {
-        Git::pull(&source.root, dry_run)
+        pull_source(source, dry_run)
     }) {
         println!("  - [{}] {}", source.name, source.root.display());
         match result {
@@ -717,6 +717,23 @@ fn pull_yaml_sources(
     }
 
     Ok(())
+}
+
+/// Pulls one YAML source, unless that would merge into uncommitted local work.
+///
+/// Leaving the source stale is reported and treated as a success: it is not a
+/// failure the caller has to confirm, and refusing to touch edited manifests is
+/// the point.
+fn pull_source(source: &YamlSource, dry_run: bool) -> Result<GitPullReport> {
+    if !dry_run && Git::is_dirty(&source.root)? {
+        return Ok(GitPullReport {
+            stdout: "Skipped: the working copy has uncommitted changes, so it was not pulled.\nManifests read from it may be stale.\n".to_string(),
+            stderr: String::new(),
+            success: true,
+        });
+    }
+
+    Git::pull(&source.root, dry_run)
 }
 
 fn collect_parallel_pull_results<T, F>(
@@ -1719,6 +1736,49 @@ mod tests {
         // nobody to confirm the failure, aborts. --no-fetch never gets there.
         assert!(pull_yaml_sources(&env, false, false, "listing", blocked()).is_err());
         assert!(pull_yaml_sources(&env, false, true, "listing", blocked()).is_ok());
+    }
+
+    #[test]
+    fn test_pull_source_skips_a_dirty_working_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Untracked content is enough to make the working copy dirty.
+        std::fs::write(root.join("manifest.yml"), "kind: Deployment\n").unwrap();
+
+        let source = YamlSource {
+            name: "main".to_string(),
+            root: root.to_path_buf(),
+        };
+
+        let report = pull_source(&source, false).unwrap();
+        assert!(report.success);
+        assert!(
+            report.stdout.contains("uncommitted changes"),
+            "{}",
+            report.stdout
+        );
+    }
+
+    #[test]
+    fn test_pull_source_does_not_inspect_the_working_copy_in_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = YamlSource {
+            name: "main".to_string(),
+            root: dir.path().to_path_buf(),
+        };
+
+        // Not a repository at all: reaching git status would fail.
+        let report = pull_source(&source, true).unwrap();
+        assert!(report.stdout.contains("Dry-run"), "{}", report.stdout);
     }
 
     #[test]

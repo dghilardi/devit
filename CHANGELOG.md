@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added `deploy --confirm-env <NAME>`, the explicit opt-in that replaces the typed confirmation when deploying to a protected environment without a terminal.
 
 ### Changed
+- YAML sources with uncommitted changes are no longer pulled: the refresh reports them as skipped and leaves the working copy alone, instead of turning a read into a merge.
 - Added a pre-apply remote alignment check during `deploy` using `kubectl diff`, warning with the live diff and asking for confirmation before continuing when the selected manifest has drifted from the cluster.
 
 ## [0.3.0] 2026-06-17
