@@ -10,6 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - `deploy --dry-run` no longer reaches any interactive prompt: the protected-environment confirmation, the diff approval, the rollout dashboard and the commit confirmation are all skipped, so a dry run now completes without a terminal.
 
+### Added
+- Added a global `--non-interactive` flag, also inferred when stdin is not a terminal, that never prompts and instead fails naming the decision it could not ask and the valid values to supply. Ambiguous `--service`, `--env` and `--tag` values now list their candidates instead of surfacing `The input device is not a TTY`.
+- Added `deploy --confirm-env <NAME>`, the explicit opt-in that replaces the typed confirmation when deploying to a protected environment without a terminal.
+
 ### Changed
 - Added a pre-apply remote alignment check during `deploy` using `kubectl diff`, warning with the live diff and asking for confirmation before continuing when the selected manifest has drifted from the cluster.
 
