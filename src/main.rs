@@ -3,6 +3,7 @@ mod config;
 mod dashboard;
 mod git;
 mod info;
+mod prompt;
 mod registry;
 
 use anyhow::{Context, Result};
@@ -13,15 +14,17 @@ use config::{Config, Environment, ServiceSource, YamlSource};
 use crossterm::{
     cursor::MoveToColumn,
     event::{self, Event, KeyCode, KeyEventKind},
-    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode},
+    terminal::{Clear, ClearType, disable_raw_mode, enable_raw_mode, size as terminal_size},
 };
 use dashboard::{Dashboard, DashboardExit};
-use git::Git;
+use git::{Git, GitPullReport};
 use inquire::{Confirm, Select, Text};
+use prompt::{PromptPolicy, format_candidates};
 use registry::{ImageMetadata, Registry};
 use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Write};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::thread;
@@ -31,11 +34,27 @@ const MAX_PARALLEL_PULLS: usize = 5;
 const TAG_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const TAG_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TAG_WAIT_CANCELLED_MESSAGE: &str = "__TAG_WAIT_CANCELLED__";
+/// Stands for "declares no namespace of its own", in the NAMESPACE column and
+/// in `--namespace` alike, so the listing round-trips. A lone `-` cannot
+/// collide with a real namespace: those must start and end alphanumerically.
+const NO_NAMESPACE: &str = "-";
+
+#[derive(Debug, PartialEq, Eq)]
+enum RemoteManifestDiffCheck {
+    InSync,
+    Drift(String),
+    CheckFailed(String),
+    SkippedDryRun,
+}
 
 #[derive(Parser)]
 #[command(name = "davit")]
 #[command(about = "A safe Kubernetes deployment wrapper & TUI", long_about = None)]
 struct Cli {
+    /// Never prompt; fail instead, naming the decision that would have been asked
+    #[arg(long, global = true)]
+    non_interactive: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -52,6 +71,10 @@ enum Commands {
         #[arg(short, long)]
         service: Option<String>,
 
+        /// Kubernetes namespace, or `-` for manifests that declare none, to disambiguate a service name
+        #[arg(short, long, allow_hyphen_values = true)]
+        namespace: Option<String>,
+
         /// Image tag to deploy
         #[arg(short, long)]
         tag: Option<String>,
@@ -64,6 +87,10 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Read the YAML sources as they are on disk, without running git pull first
+        #[arg(long)]
+        no_fetch: bool,
+
         /// Apply the selected version immediately and continue automatically through rollout and Git steps
         #[arg(long)]
         auto_apply: bool,
@@ -71,6 +98,10 @@ enum Commands {
         /// After `kubectl apply`, continue automatically through rollout completion and Git push unless errors occur
         #[arg(long)]
         auto_continue: bool,
+
+        /// Confirm a protected environment without prompting; must match the target environment name
+        #[arg(long, value_name = "NAME")]
+        confirm_env: Option<String>,
     },
     /// Show deployment information for a service
     Info {
@@ -78,18 +109,47 @@ enum Commands {
         #[arg(short, long)]
         env: Option<String>,
 
-        /// Kubernetes namespace filter
-        #[arg(short, long)]
+        /// Kubernetes namespace filter, or `-` for manifests that declare none
+        #[arg(short, long, allow_hyphen_values = true)]
         namespace: Option<String>,
 
         /// Service name to inspect
         #[arg(short, long)]
         service: Option<String>,
+
+        /// Read the YAML sources as they are on disk, without running git pull first
+        #[arg(long)]
+        no_fetch: bool,
+    },
+    /// List the identifiers accepted by --env and --service
+    List {
+        #[command(subcommand)]
+        command: ListCommands,
     },
     /// Configuration management
     Config {
         #[command(subcommand)]
         command: ConfigCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ListCommands {
+    /// List the configured environments
+    Envs,
+    /// List the services discovered in an environment's YAML sources
+    Services {
+        /// Target environment (e.g., staging, production)
+        #[arg(short, long)]
+        env: Option<String>,
+
+        /// Only list services in this namespace, or `-` for those that declare none
+        #[arg(short, long, allow_hyphen_values = true)]
+        namespace: Option<String>,
+
+        /// Read the YAML sources as they are on disk, without running git pull first
+        #[arg(long)]
+        no_fetch: bool,
     },
 }
 
@@ -105,26 +165,41 @@ enum ConfigCommands {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = Config::load().context("Failed to load configuration")?;
+    let policy = PromptPolicy::resolve(cli.non_interactive);
 
     match cli.command {
         Commands::Deploy {
             env,
             service,
+            namespace,
             tag,
             wait_for_tag,
             dry_run,
+            no_fetch,
             auto_apply,
             auto_continue,
+            confirm_env,
         } => {
             let auto_continue = auto_continue || auto_apply;
-            let selected_env = resolve_environment(&config, env)?;
+            let selected_env = resolve_environment(&config, env, policy)?;
 
-            pull_yaml_sources(&selected_env, dry_run, "deployment")?;
+            pull_yaml_sources(&selected_env, dry_run, no_fetch, "deployment", policy)?;
 
-            let selected_service = resolve_service(&selected_env, service)?;
+            let selected_service =
+                resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
+
+            let remote_diff = check_remote_manifest_diff(
+                &selected_env.kubectl_context,
+                &selected_service.yaml_path,
+                dry_run,
+            )?;
+            if !confirm_remote_manifest_diff(&selected_service.yaml_path, remote_diff, policy)? {
+                println!("Deployment cancelled. No changes made.");
+                return Ok(());
+            }
 
             let selected_tag =
-                match resolve_tag(&selected_env, &selected_service, tag, wait_for_tag) {
+                match resolve_tag(&selected_env, &selected_service, tag, wait_for_tag, policy) {
                     Ok(tag) => tag,
                     Err(err) if err.to_string() == TAG_WAIT_CANCELLED_MESSAGE => {
                         println!("Tag wait cancelled. Deployment aborted.");
@@ -135,20 +210,12 @@ async fn main() -> Result<()> {
 
             // 6.3 Production Protection
             if selected_env.protected.unwrap_or(false) {
-                println!(
-                    "⚠️  WARNING: Deployment to {} is PROTECTED!",
-                    selected_env.name
-                );
-                let confirmation = Text::new(&format!(
-                    "Type the environment name '{}' to confirm:",
-                    selected_env.name
-                ))
-                .prompt()
-                .context("Production confirmation was cancelled")?;
-
-                if confirmation != selected_env.name {
-                    return Err(anyhow::anyhow!("Confirmation failed. Deployment aborted."));
-                }
+                confirm_protected_environment(
+                    &selected_env.name,
+                    confirm_env.as_deref(),
+                    dry_run,
+                    policy,
+                )?;
             }
 
             // Phase 4 - YAML modification & Visual Diff
@@ -176,17 +243,18 @@ async fn main() -> Result<()> {
             loop {
                 Blueprint::show_diff(&original_content, &updated_content, filename, show_unified);
 
+                if dry_run {
+                    println!(
+                        "Dry-run: would write updated YAML to {}",
+                        yaml_path.display()
+                    );
+                    break;
+                }
+
                 if auto_apply {
-                    if dry_run {
-                        println!(
-                            "Dry-run: would write updated YAML to {}",
-                            yaml_path.display()
-                        );
-                    } else {
-                        fs::write(&yaml_path, &updated_content).with_context(|| {
-                            format!("Failed to write updated YAML to {}", yaml_path.display())
-                        })?;
-                    }
+                    fs::write(&yaml_path, &updated_content).with_context(|| {
+                        format!("Failed to write updated YAML to {}", yaml_path.display())
+                    })?;
                     println!("Auto-apply enabled. Local YAML updated. Executing kubectl apply...");
                     break;
                 }
@@ -197,20 +265,20 @@ async fn main() -> Result<()> {
                     vec!["Apply", "Show unified diff", "Dismiss"]
                 };
 
-                let selection = Select::new("Action:", choices).prompt()?;
+                let selection = policy.select(
+                    "approval of the manifest change",
+                    "Action:",
+                    choices.into_iter().map(str::to_string).collect(),
+                    "Re-run with --auto-apply to apply it without asking, or --dry-run to preview only.",
+                )?;
+
+                let selection = selection.as_str();
 
                 match selection {
                     "Apply" => {
-                        if dry_run {
-                            println!(
-                                "Dry-run: would write updated YAML to {}",
-                                yaml_path.display()
-                            );
-                        } else {
-                            fs::write(&yaml_path, &updated_content).with_context(|| {
-                                format!("Failed to write updated YAML to {}", yaml_path.display())
-                            })?;
-                        }
+                        fs::write(&yaml_path, &updated_content).with_context(|| {
+                            format!("Failed to write updated YAML to {}", yaml_path.display())
+                        })?;
                         println!("Local YAML updated. Executing kubectl apply...");
                         break;
                     }
@@ -244,58 +312,49 @@ async fn main() -> Result<()> {
                 if !output.status.success() {
                     let stderr = String::from_utf8_lossy(&output.stderr);
                     println!("❌ kubectl apply failed: {}", stderr);
-                    if !auto_continue {
-                        if Confirm::new("Revert local YAML changes?")
-                            .with_default(true)
-                            .prompt()?
-                        {
-                            fs::write(&yaml_path, &original_content)?;
-                            println!("YAML reverted.");
-                        }
-                    }
+                    offer_revert(&yaml_path, &original_content, auto_continue, policy)?;
                     return Err(anyhow::anyhow!("kubectl apply failed"));
                 }
             }
 
-            println!("Deployment applied. Starting dashboard...");
+            if dry_run {
+                println!(
+                    "Dry-run: would monitor the rollout of {} in the dashboard.",
+                    selected_service.name
+                );
+            } else {
+                println!("Deployment applied. Starting dashboard...");
 
-            let mut dashboard = Dashboard::new(
-                selected_service.name.clone(),
-                selected_service.kind.clone(),
-                selected_env.name.clone(),
-                selected_tag.clone(),
-                selected_env.kubectl_context.clone(),
-                selected_service.namespace.clone(),
-                selected_service.selector.clone(),
-                selected_service.container_name.clone(),
-                auto_continue,
-            );
-            let res = dashboard.run().await;
+                let mut dashboard = Dashboard::new(
+                    selected_service.name.clone(),
+                    selected_service.kind.clone(),
+                    selected_env.name.clone(),
+                    selected_tag.clone(),
+                    selected_env.kubectl_context.clone(),
+                    selected_service.namespace.clone(),
+                    selected_service.selector.clone(),
+                    selected_service.container_name.clone(),
+                    auto_continue,
+                );
+                let res = dashboard.run().await;
 
-            match res {
-                Err(e) => {
-                    println!("❌ Dashboard error or aborted: {}", e);
-                    if !auto_continue {
-                        if Confirm::new("Revert local YAML changes?")
-                            .with_default(true)
-                            .prompt()?
-                        {
-                            fs::write(&yaml_path, &original_content)?;
-                            println!("YAML reverted.");
+                match res {
+                    Err(e) => {
+                        println!("❌ Dashboard error or aborted: {}", e);
+                        offer_revert(&yaml_path, &original_content, auto_continue, policy)?;
+                        return Err(e);
+                    }
+                    Ok(DashboardExit::UserQuit) => {
+                        if auto_continue {
+                            return Err(anyhow::anyhow!(
+                                "Dashboard closed before rollout completion in auto-continue mode"
+                            ));
                         }
+                        println!("Dashboard closed before rollout completion check.");
                     }
-                    return Err(e);
-                }
-                Ok(DashboardExit::UserQuit) => {
-                    if auto_continue {
-                        return Err(anyhow::anyhow!(
-                            "Dashboard closed before rollout completion in auto-continue mode"
-                        ));
+                    Ok(DashboardExit::RolloutCompleted) => {
+                        println!("Rollout completed. Continuing to the Git step...");
                     }
-                    println!("Dashboard closed before rollout completion check.");
-                }
-                Ok(DashboardExit::RolloutCompleted) => {
-                    println!("Rollout completed. Continuing to the Git step...");
                 }
             }
 
@@ -312,7 +371,7 @@ async fn main() -> Result<()> {
             Blueprint::show_diff(&original_content, &updated_content, filename, true);
             println!("--------------------\n");
 
-            if auto_continue {
+            if auto_continue || dry_run {
                 Git::commit_and_push(
                     &selected_service.source_root,
                     &commit_msg,
@@ -323,10 +382,12 @@ async fn main() -> Result<()> {
                     println!("✅ Changes committed and pushed to Git.");
                 }
             } else {
-                if Confirm::new("Do you want to commit and push these changes?")
-                    .with_default(true)
-                    .prompt()?
-                {
+                if policy.confirm(
+                    "approval to commit and push",
+                    "Do you want to commit and push these changes?",
+                    true,
+                    "Re-run with --auto-continue to commit and push without asking.",
+                )? {
                     if let Err(e) = Git::commit_and_push(
                         &selected_service.source_root,
                         &commit_msg,
@@ -346,15 +407,40 @@ async fn main() -> Result<()> {
             env,
             namespace,
             service,
+            no_fetch,
         } => {
-            let selected_env = resolve_environment(&config, env)?;
+            let selected_env = resolve_environment(&config, env, policy)?;
 
-            pull_yaml_sources(&selected_env, false, "info")?;
+            pull_yaml_sources(&selected_env, false, no_fetch, "info", policy)?;
 
             let selected_service =
-                resolve_service_with_ns_filter(&selected_env, service, namespace)?;
+                resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
             info::show_info(&selected_env, &selected_service).await?;
         }
+        Commands::List { command } => match command {
+            ListCommands::Envs => {
+                for environment in &config.environments {
+                    let protected = if environment.protected.unwrap_or(false) {
+                        "  (protected)"
+                    } else {
+                        ""
+                    };
+                    println!("{}{}", environment.name, protected);
+                }
+            }
+            ListCommands::Services {
+                env,
+                namespace,
+                no_fetch,
+            } => {
+                let selected_env = resolve_environment(&config, env, policy)?;
+
+                pull_yaml_sources(&selected_env, false, no_fetch, "listing", policy)?;
+
+                let services = list_services_in_namespace(&selected_env, namespace.as_deref())?;
+                print_service_list(&services);
+            }
+        },
         Commands::Config { command } => match command {
             ConfigCommands::Show => {
                 println!("{:#?}", config);
@@ -369,14 +455,21 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_environment(config: &Config, input: Option<String>) -> Result<Environment> {
+fn resolve_environment(
+    config: &Config,
+    input: Option<String>,
+    policy: PromptPolicy,
+) -> Result<Environment> {
     let env_names: Vec<String> = config.environments.iter().map(|e| e.name.clone()).collect();
 
     let name = match input {
-        Some(val) => resolve_from_list("Environment", &env_names, val)?,
-        None => Select::new("Select Environment:", env_names.clone())
-            .prompt()
-            .context("Environment selection was cancelled")?,
+        Some(val) => resolve_from_list("Environment", &env_names, val, policy)?,
+        None => policy.select(
+            "an environment",
+            "Select Environment:",
+            env_names.clone(),
+            &format!("Pass --env with one of:\n{}", format_candidates(&env_names)),
+        )?,
     };
 
     config
@@ -425,41 +518,83 @@ fn get_service_display_name(
     )
 }
 
-fn resolve_service(env: &Environment, input: Option<String>) -> Result<ServiceSource> {
-    let services = env
-        .list_services()
-        .context("Failed to list services in repo_root")?;
-    resolve_service_from_list(services, env, input)
-}
-
-fn resolve_service_with_ns_filter(
+/// Lists services in a stable order, optionally narrowed to one namespace.
+///
+/// The order matters beyond presentation: it fixes the order of the candidate
+/// lists reported when a selection cannot be made, and of the prompt itself.
+fn list_services_in_namespace(
     env: &Environment,
-    input: Option<String>,
-    namespace: Option<String>,
-) -> Result<ServiceSource> {
+    namespace: Option<&str>,
+) -> Result<Vec<ServiceSource>> {
     let all_services = env.list_services().context("Failed to list services")?;
 
-    let services = match namespace {
-        Some(ref ns) => {
+    let mut services = match namespace {
+        Some(ns) => {
             let filtered: Vec<ServiceSource> = all_services
                 .into_iter()
-                .filter(|s| s.namespace.as_deref() == Some(ns.as_str()))
+                .filter(|service| namespace_label(service) == ns)
                 .collect();
             if filtered.is_empty() {
-                return Err(anyhow::anyhow!("No services found in namespace '{}'", ns));
+                return Err(if ns == NO_NAMESPACE {
+                    anyhow::anyhow!("No services without a declared namespace found")
+                } else {
+                    anyhow::anyhow!("No services found in namespace '{}'", ns)
+                });
             }
             filtered
         }
         None => all_services,
     };
 
-    resolve_service_from_list(services, env, input)
+    services.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.namespace.cmp(&b.namespace))
+            .then_with(|| a.yaml_path.cmp(&b.yaml_path))
+    });
+
+    Ok(services)
+}
+
+fn resolve_service_with_ns_filter(
+    env: &Environment,
+    input: Option<String>,
+    namespace: Option<String>,
+    policy: PromptPolicy,
+) -> Result<ServiceSource> {
+    let services = list_services_in_namespace(env, namespace.as_deref())?;
+    let input = input.map(|value| strip_namespace_suffix(value, namespace.as_deref()));
+    resolve_service_from_list(services, env, input, policy)
+}
+
+/// Drops the `(namespace)` suffix from a service name already narrowed by `--namespace`.
+///
+/// `list services` disambiguates names across the whole environment, so it
+/// prints `svc-api (tenant-b)`. Passing that back together with the NAMESPACE
+/// column would otherwise fail, because within the narrowed set the name no
+/// longer collides and is rendered plain.
+fn strip_namespace_suffix(value: String, namespace: Option<&str>) -> String {
+    let Some(namespace) = namespace else {
+        return value;
+    };
+
+    let rendered = if namespace == NO_NAMESPACE {
+        "no-namespace"
+    } else {
+        namespace
+    };
+
+    match value.strip_suffix(&format!(" ({})", rendered)) {
+        Some(stripped) => stripped.to_string(),
+        None => value,
+    }
 }
 
 fn resolve_service_from_list(
     services: Vec<ServiceSource>,
     env: &Environment,
     input: Option<String>,
+    policy: PromptPolicy,
 ) -> Result<ServiceSource> {
     if services.is_empty() {
         return Err(anyhow::anyhow!(
@@ -477,10 +612,16 @@ fn resolve_service_from_list(
     let display_names: Vec<String> = service_map.iter().map(|(n, _)| n.clone()).collect();
 
     let selected_name = match input {
-        Some(val) => resolve_from_list("Service", &display_names, val)?,
-        None => Select::new("Select Service:", display_names.clone())
-            .prompt()
-            .context("Service selection was cancelled")?,
+        Some(val) => resolve_from_list("Service", &display_names, val, policy)?,
+        None => policy.select(
+            "a service",
+            "Select Service:",
+            display_names.clone(),
+            &format!(
+                "Pass --service with one of:\n{}",
+                format_candidates(&display_names)
+            ),
+        )?,
     };
 
     service_map
@@ -490,13 +631,65 @@ fn resolve_service_from_list(
         .context("Resolved service not found in list")
 }
 
+/// Prints the values `--service` accepts, alongside what each one resolves to.
+fn print_service_list(services: &[ServiceSource]) {
+    let rows: Vec<(String, &ServiceSource)> = services
+        .iter()
+        .map(|service| (get_service_display_name(service, services), service))
+        .collect();
+
+    let name_width = rows
+        .iter()
+        .map(|(name, _)| name.chars().count())
+        .chain(std::iter::once("SERVICE".len()))
+        .max()
+        .unwrap_or_default();
+    let namespace_width = rows
+        .iter()
+        .map(|(_, service)| namespace_label(service).chars().count())
+        .chain(std::iter::once("NAMESPACE".len()))
+        .max()
+        .unwrap_or_default();
+
+    println!(
+        "{:<name_width$}  {:<namespace_width$}  {:<12}  MANIFEST",
+        "SERVICE", "NAMESPACE", "KIND"
+    );
+
+    for (name, service) in &rows {
+        println!(
+            "{:<name_width$}  {:<namespace_width$}  {:<12}  {}",
+            name,
+            namespace_label(service),
+            service.kind,
+            get_service_source_display_path(service)
+        );
+    }
+}
+
+/// The namespace as the manifest declares it; `--namespace` matches this value.
+fn namespace_label(service: &ServiceSource) -> &str {
+    service.namespace.as_deref().unwrap_or(NO_NAMESPACE)
+}
+
 fn get_service_source_display_path(service: &ServiceSource) -> String {
     let relative_path = pathdiff::diff_paths(&service.yaml_path, &service.source_root)
         .unwrap_or_else(|| service.yaml_path.clone());
     format!("[{}]/{}", service.source_name, relative_path.display())
 }
 
-fn pull_yaml_sources(env: &Environment, dry_run: bool, action: &str) -> Result<()> {
+fn pull_yaml_sources(
+    env: &Environment,
+    dry_run: bool,
+    no_fetch: bool,
+    action: &str,
+    policy: PromptPolicy,
+) -> Result<()> {
+    if no_fetch {
+        println!("Skipping the YAML source refresh (--no-fetch); reading manifests from disk.");
+        return Ok(());
+    }
+
     let sources = unique_yaml_sources(env);
 
     if sources.is_empty() {
@@ -512,9 +705,11 @@ fn pull_yaml_sources(env: &Environment, dry_run: bool, action: &str) -> Result<(
     }
 
     let mut failures = Vec::new();
-    for (source, result) in collect_parallel_pull_results(&sources, MAX_PARALLEL_PULLS, move |source| {
-        Git::pull(&source.root, dry_run)
-    }) {
+    for (source, result) in
+        collect_parallel_pull_results(&sources, MAX_PARALLEL_PULLS, move |source| {
+            pull_source(source, dry_run)
+        })
+    {
         println!("  - [{}] {}", source.name, source.root.display());
         match result {
             Ok(report) => {
@@ -538,10 +733,15 @@ fn pull_yaml_sources(env: &Environment, dry_run: bool, action: &str) -> Result<(
         println!("  - [{}] {}: {}", source.name, source.root.display(), error);
     }
 
-    if !Confirm::new(&format!("Do you want to continue with {} anyway?", action))
-        .with_default(false)
-        .prompt()?
-    {
+    if !policy.confirm(
+        &format!(
+            "approval to continue with {} after a failed git pull",
+            action
+        ),
+        &format!("Do you want to continue with {} anyway?", action),
+        false,
+        "Fix the YAML sources listed above before retrying.",
+    )? {
         return Err(anyhow::anyhow!(
             "{} aborted by user after git pull failure.",
             capitalize_action(action)
@@ -549,6 +749,23 @@ fn pull_yaml_sources(env: &Environment, dry_run: bool, action: &str) -> Result<(
     }
 
     Ok(())
+}
+
+/// Pulls one YAML source, unless that would merge into uncommitted local work.
+///
+/// Leaving the source stale is reported and treated as a success: it is not a
+/// failure the caller has to confirm, and refusing to touch edited manifests is
+/// the point.
+fn pull_source(source: &YamlSource, dry_run: bool) -> Result<GitPullReport> {
+    if !dry_run && Git::is_dirty(&source.root)? {
+        return Ok(GitPullReport {
+            stdout: "Skipped: the working copy has uncommitted changes, so it was not pulled.\nManifests read from it may be stale.\n".to_string(),
+            stderr: String::new(),
+            success: true,
+        });
+    }
+
+    Git::pull(&source.root, dry_run)
 }
 
 fn collect_parallel_pull_results<T, F>(
@@ -627,14 +844,210 @@ fn capitalize_action(action: &str) -> String {
     }
 }
 
+fn check_remote_manifest_diff(
+    kubectl_context: &str,
+    yaml_path: &Path,
+    dry_run: bool,
+) -> Result<RemoteManifestDiffCheck> {
+    if dry_run {
+        println!(
+            "Dry-run: kubectl --context {} diff -f {}",
+            kubectl_context,
+            yaml_path.display()
+        );
+        return Ok(RemoteManifestDiffCheck::SkippedDryRun);
+    }
+
+    let output = Command::new("kubectl")
+        .args([
+            "--context",
+            kubectl_context,
+            "diff",
+            "-f",
+            yaml_path.to_str().unwrap(),
+        ])
+        .output()
+        .context("Failed to execute kubectl diff")?;
+
+    Ok(classify_kubectl_diff_result(
+        output.status.code(),
+        &output.stdout,
+        &output.stderr,
+    ))
+}
+
+fn classify_kubectl_diff_result(
+    status_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> RemoteManifestDiffCheck {
+    let output = combine_command_output(stdout, stderr);
+
+    match status_code {
+        Some(0) => RemoteManifestDiffCheck::InSync,
+        Some(1) => RemoteManifestDiffCheck::Drift(output),
+        Some(code) => RemoteManifestDiffCheck::CheckFailed(format!(
+            "kubectl diff exited with status {}.\n{}",
+            code,
+            fallback_command_output(output)
+        )),
+        None => RemoteManifestDiffCheck::CheckFailed(format!(
+            "kubectl diff terminated without an exit status.\n{}",
+            fallback_command_output(output)
+        )),
+    }
+}
+
+fn combine_command_output(stdout: &[u8], stderr: &[u8]) -> String {
+    let stdout = String::from_utf8_lossy(stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("{}\n{}", stdout, stderr),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (true, true) => String::new(),
+    }
+}
+
+fn fallback_command_output(output: String) -> String {
+    if output.is_empty() {
+        "No output returned by kubectl diff.".to_string()
+    } else {
+        output
+    }
+}
+
+fn confirm_remote_manifest_diff(
+    yaml_path: &Path,
+    diff_check: RemoteManifestDiffCheck,
+    policy: PromptPolicy,
+) -> Result<bool> {
+    match diff_check {
+        RemoteManifestDiffCheck::InSync | RemoteManifestDiffCheck::SkippedDryRun => Ok(true),
+        RemoteManifestDiffCheck::Drift(diff) => {
+            println!(
+                "\n⚠️  Remote cluster state is not aligned with {}.",
+                yaml_path.display()
+            );
+            if diff.is_empty() {
+                println!("kubectl diff detected changes but did not return a diff body.");
+            } else {
+                println!("{}", diff);
+            }
+
+            policy.confirm(
+                "approval to deploy despite remote drift",
+                "Do you want to continue with deployment despite this drift?",
+                false,
+                "Align the cluster with the manifest before deploying, or inspect the drift with --dry-run.",
+            )
+        }
+        RemoteManifestDiffCheck::CheckFailed(message) => {
+            println!("\n⚠️  Could not verify remote manifest alignment.");
+            println!("{}", message);
+
+            policy.confirm(
+                "approval to deploy without the remote alignment check",
+                "Do you want to continue without the remote alignment check?",
+                false,
+                "Make `kubectl diff` succeed against the target context before deploying.",
+            )
+        }
+    }
+}
+
+/// Guards a deployment to a protected environment.
+///
+/// Interactively the guard is typing the environment name back. Unattended it
+/// is `--confirm-env`, an explicit opt-in the caller has to spell out, rather
+/// than a prompt that a non-TTY run would simply skip past.
+fn confirm_protected_environment(
+    env_name: &str,
+    confirm_env: Option<&str>,
+    dry_run: bool,
+    policy: PromptPolicy,
+) -> Result<()> {
+    println!("⚠️  WARNING: Deployment to {} is PROTECTED!", env_name);
+
+    if dry_run {
+        println!("Dry-run: skipping the protected environment confirmation.");
+        return Ok(());
+    }
+
+    let confirmation = match confirm_env {
+        Some(value) => value.to_string(),
+        None if policy.is_interactive() => Text::new(&format!(
+            "Type the environment name '{}' to confirm:",
+            env_name
+        ))
+        .prompt()
+        .context("Production confirmation was cancelled")?,
+        None => {
+            return Err(policy.cannot_ask(
+                "confirmation of a protected environment",
+                &format!(
+                    "Pass --confirm-env {} to confirm the deployment explicitly.",
+                    env_name
+                ),
+            ));
+        }
+    };
+
+    if confirmation != env_name {
+        return Err(anyhow::anyhow!(
+            "Confirmation '{}' does not match the target environment '{}'. Deployment aborted.",
+            confirmation,
+            env_name
+        ));
+    }
+
+    Ok(())
+}
+
+/// Offers to undo the local manifest edit after a failed deploy.
+///
+/// This runs on an error path, so a missing terminal must not replace the
+/// original failure with a prompt failure: the edit is reported and left in
+/// place for the caller to deal with.
+fn offer_revert(
+    yaml_path: &Path,
+    original_content: &str,
+    auto_continue: bool,
+    policy: PromptPolicy,
+) -> Result<()> {
+    if auto_continue {
+        return Ok(());
+    }
+
+    if !policy.is_interactive() {
+        println!(
+            "Local YAML at {} still holds the updated tag; revert it manually if needed.",
+            yaml_path.display()
+        );
+        return Ok(());
+    }
+
+    if Confirm::new("Revert local YAML changes?")
+        .with_default(true)
+        .prompt()?
+    {
+        fs::write(yaml_path, original_content)?;
+        println!("YAML reverted.");
+    }
+
+    Ok(())
+}
+
 fn resolve_tag(
     env: &Environment,
     service: &ServiceSource,
     input: Option<String>,
     wait_for_tag: Option<String>,
+    policy: PromptPolicy,
 ) -> Result<String> {
     if let Some(tag) = wait_for_tag {
-        return wait_for_exact_tag(env, service, tag);
+        return wait_for_exact_tag(env, service, tag, policy);
     }
 
     if let Some(tag) = input {
@@ -648,7 +1061,7 @@ fn resolve_tag(
             ));
         }
 
-        return resolve_from_list("Image tag", &available_tags, tag);
+        return resolve_from_list("Image tag", &available_tags, tag, policy);
     }
 
     let images = fetch_service_images(env, service, true)?;
@@ -673,9 +1086,15 @@ fn resolve_tag(
         })
         .collect();
 
-    let selection = Select::new("Select Image Tag:", options)
-        .prompt()
-        .context("Image selection was cancelled")?;
+    let selection = policy.select(
+        "an image tag",
+        "Select Image Tag:",
+        options,
+        &format!(
+            "Pass --tag with one of:\n{}",
+            format_candidates(&available_tags)
+        ),
+    )?;
 
     let tag = selection
         .split_whitespace()
@@ -729,7 +1148,12 @@ fn collect_available_tags(images: &[ImageMetadata]) -> Vec<String> {
     tags
 }
 
-fn wait_for_exact_tag(env: &Environment, service: &ServiceSource, tag: String) -> Result<String> {
+fn wait_for_exact_tag(
+    env: &Environment,
+    service: &ServiceSource,
+    tag: String,
+    policy: PromptPolicy,
+) -> Result<String> {
     let mut attempt = 1;
 
     println!(
@@ -738,25 +1162,27 @@ fn wait_for_exact_tag(env: &Environment, service: &ServiceSource, tag: String) -
     );
     println!("Registry image: {}", service.image_path);
     println!(
-        "Polling every {} seconds. Press 'q' to cancel.",
-        TAG_RETRY_INTERVAL.as_secs()
+        "Polling every {} seconds.{}",
+        TAG_RETRY_INTERVAL.as_secs(),
+        if policy.is_interactive() {
+            " Press 'q' to cancel."
+        } else {
+            ""
+        }
     );
 
     loop {
-        render_tag_wait_status(
-            &tag,
-            &service.name,
-            attempt,
-            "Checking registry",
-            None,
-            '.',
-        )?;
+        if policy.is_interactive() {
+            render_tag_wait_status(&tag, &service.name, attempt, "Checking registry", None, '.')?;
+        }
 
         let images = fetch_service_images(env, service, false)?;
         let available_tags = collect_available_tags(&images);
 
         if available_tags.iter().any(|available| available == &tag) {
-            clear_tag_wait_status_line()?;
+            if policy.is_interactive() {
+                clear_tag_wait_status_line()?;
+            }
             if attempt == 1 {
                 println!("Found image tag '{}'.", tag);
             } else {
@@ -768,12 +1194,29 @@ fn wait_for_exact_tag(env: &Environment, service: &ServiceSource, tag: String) -
             return Ok(tag);
         }
 
-        wait_for_next_tag_check(service, &tag, attempt)?;
+        wait_for_next_tag_check(service, &tag, attempt, policy)?;
         attempt += 1;
     }
 }
 
-fn wait_for_next_tag_check(service: &ServiceSource, tag: &str, attempt: usize) -> Result<()> {
+fn wait_for_next_tag_check(
+    service: &ServiceSource,
+    tag: &str,
+    attempt: usize,
+    policy: PromptPolicy,
+) -> Result<()> {
+    // Raw mode and the 'q' shortcut both need a terminal; without one, just wait.
+    if !policy.is_interactive() {
+        println!(
+            "Tag '{}' not available yet (check {}). Retrying in {} seconds.",
+            tag,
+            attempt,
+            TAG_RETRY_INTERVAL.as_secs()
+        );
+        thread::sleep(TAG_RETRY_INTERVAL);
+        return Ok(());
+    }
+
     let _raw_mode = RawModeGuard::new()?;
     let spinner = ['|', '/', '-', '\\'];
     let start = Instant::now();
@@ -826,8 +1269,8 @@ fn wait_for_next_tag_check(service: &ServiceSource, tag: &str, attempt: usize) -
 }
 
 fn render_tag_wait_status(
-    tag: &str,
-    service_name: &str,
+    _tag: &str,
+    _service_name: &str,
     attempt: usize,
     phase: &str,
     remaining: Option<(u64, u64)>,
@@ -835,29 +1278,59 @@ fn render_tag_wait_status(
 ) -> Result<()> {
     clear_tag_wait_status_line()?;
 
-    match remaining {
+    let status = match remaining {
         Some((minutes, seconds)) => {
-            print!(
-                "{} {} for '{}' on {}. Checks: {}. Next check in {:02}:{:02}. Press 'q' to cancel.",
-                marker, phase, tag, service_name, attempt, minutes, seconds
-            );
+            format!(
+                "{} {} | check {} | next {:02}:{:02} | q cancel",
+                marker, phase, attempt, minutes, seconds
+            )
         }
         None => {
-            print!(
-                "{} {} for '{}' on {}. Checks completed: {}. Press 'q' to cancel.",
-                marker, phase, tag, service_name, attempt.saturating_sub(1)
-            );
+            format!(
+                "{} {} | completed {} | q cancel",
+                marker,
+                phase,
+                attempt.saturating_sub(1)
+            )
         }
-    }
+    };
+
+    let terminal_width = terminal_size()
+        .map(|(width, _)| width as usize)
+        .unwrap_or(120);
+    print!("{}", truncate_for_terminal_width(&status, terminal_width));
 
     io::stdout().flush()?;
     Ok(())
 }
 
 fn clear_tag_wait_status_line() -> Result<()> {
-    crossterm::execute!(io::stdout(), MoveToColumn(0), Clear(ClearType::CurrentLine))
+    crossterm::execute!(io::stdout(), MoveToColumn(0), Clear(ClearType::FromCursorDown))
         .context("Failed to refresh tag wait status line")?;
     Ok(())
+}
+
+fn truncate_for_terminal_width(input: &str, width: usize) -> String {
+    let safe_width = width.saturating_sub(1);
+    let char_count = input.chars().count();
+    if char_count <= safe_width {
+        return input.to_string();
+    }
+
+    if safe_width == 0 {
+        return String::new();
+    }
+
+    if safe_width <= 3 {
+        return ".".repeat(safe_width);
+    }
+
+    let mut truncated = String::new();
+    for ch in input.chars().take(safe_width - 3) {
+        truncated.push(ch);
+    }
+    truncated.push_str("...");
+    truncated
 }
 
 struct RawModeGuard;
@@ -898,7 +1371,12 @@ fn mock_images() -> Vec<ImageMetadata> {
 }
 
 /// Generic disambiguation logic
-fn resolve_from_list(label: &str, items: &[String], input: String) -> Result<String> {
+fn resolve_from_list(
+    label: &str,
+    items: &[String],
+    input: String,
+    policy: PromptPolicy,
+) -> Result<String> {
     // 1. Exact match
     if items.contains(&input) {
         return Ok(input);
@@ -906,37 +1384,63 @@ fn resolve_from_list(label: &str, items: &[String], input: String) -> Result<Str
 
     // 2. Partial matches
     let matches: Vec<&String> = items.iter().filter(|&i| i.contains(&input)).collect();
+    let noun = label.to_lowercase();
+    let decision = format!("a {}", noun);
 
     match matches.len() {
         0 => {
-            println!("No {} matches '{}'.", label.to_lowercase(), input);
-            Select::new(&format!("Select {}:", label), items.to_vec())
-                .prompt()
-                .context(format!("{} selection was cancelled", label))
+            if policy.is_interactive() {
+                println!("No {} matches '{}'.", noun, input);
+            }
+            policy.select(
+                &decision,
+                &format!("Select {}:", label),
+                items.to_vec(),
+                &format!(
+                    "'{}' matches no {}. Valid values:\n{}",
+                    input,
+                    noun,
+                    format_candidates(items)
+                ),
+            )
         }
+        // A single fuzzy match is a guess, so it is offered rather than applied.
+        // Without a human to confirm it, resolving it silently could target the
+        // wrong service after a rename, so the exact value is demanded instead.
         1 => {
-            let suggest = matches[0];
+            let suggest = matches[0].clone();
+            if !policy.is_interactive() {
+                return Err(policy.cannot_ask(
+                    &decision,
+                    &format!(
+                        "'{}' is not an exact {}; the closest match is '{}'. Pass it verbatim.",
+                        input, noun, suggest
+                    ),
+                ));
+            }
+
             if Confirm::new(&format!("Did you mean '{}'?", suggest))
                 .with_default(true)
                 .prompt()?
             {
-                Ok(suggest.clone())
+                Ok(suggest)
             } else {
                 Select::new(&format!("Select {}:", label), items.to_vec())
                     .prompt()
                     .context(format!("{} selection was cancelled", label))
             }
         }
-        _ => Select::new(
+        _ => policy.select(
+            &decision,
+            &format!("Multiple matches for '{}'. Select {}:", input, noun),
+            matches.iter().map(|m| (*m).clone()).collect(),
             &format!(
-                "Multiple matches for '{}'. Select {}:",
+                "'{}' matches {} entries:\n{}\nPass one of them verbatim.",
                 input,
-                label.to_lowercase()
+                matches.len(),
+                format_candidates(&matches)
             ),
-            matches.into_iter().cloned().collect(),
-        )
-        .prompt()
-        .context(format!("{} selection was cancelled", label)),
+        ),
     }
 }
 
@@ -1077,6 +1581,422 @@ mod tests {
     fn test_deploy_auto_apply_accepts_flag() {
         let parse = Cli::try_parse_from(["davit", "deploy", "--auto-apply"]);
         assert!(parse.is_ok());
+    }
+
+    /// Non-interactive resolution never falls through to a prompt, and says why.
+    fn blocked() -> PromptPolicy {
+        PromptPolicy::new(true, true)
+    }
+
+    #[test]
+    fn test_resolve_from_list_accepts_an_exact_match_without_prompting() {
+        let items = vec!["svc-api (no-namespace)".to_string(), "billing".to_string()];
+        let resolved =
+            resolve_from_list("Service", &items, "billing".to_string(), blocked()).unwrap();
+        assert_eq!(resolved, "billing");
+    }
+
+    #[test]
+    fn test_resolve_from_list_lists_candidates_when_ambiguous() {
+        let items = vec![
+            "svc-api (no-namespace)".to_string(),
+            "svc-api (tenant-b)".to_string(),
+            "billing".to_string(),
+        ];
+        let err = resolve_from_list("Service", &items, "svc-api".to_string(), blocked())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Cannot ask for a service"), "{err}");
+        assert!(err.contains("'svc-api' matches 2 entries"), "{err}");
+        assert!(err.contains("  - svc-api (no-namespace)"), "{err}");
+        assert!(err.contains("  - svc-api (tenant-b)"), "{err}");
+        assert!(!err.contains("billing"), "{err}");
+    }
+
+    #[test]
+    fn test_resolve_from_list_refuses_to_guess_a_single_fuzzy_match() {
+        let items = vec!["billing".to_string()];
+        let err = resolve_from_list("Service", &items, "billin".to_string(), blocked())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("the closest match is 'billing'"), "{err}");
+    }
+
+    #[test]
+    fn test_resolve_from_list_lists_valid_values_when_nothing_matches() {
+        let items = vec!["preprod".to_string(), "production".to_string()];
+        let err = resolve_from_list("Environment", &items, "staging".to_string(), blocked())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("matches no environment"), "{err}");
+        assert!(err.contains("  - preprod"), "{err}");
+        assert!(err.contains("  - production"), "{err}");
+    }
+
+    #[test]
+    fn test_protected_environment_is_not_confirmed_in_dry_run() {
+        assert!(confirm_protected_environment("production", None, true, blocked()).is_ok());
+    }
+
+    #[test]
+    fn test_protected_environment_accepts_a_matching_confirm_env() {
+        assert!(
+            confirm_protected_environment("production", Some("production"), false, blocked())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_protected_environment_rejects_a_mismatched_confirm_env() {
+        let err = confirm_protected_environment("production", Some("preprod"), false, blocked())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("'preprod' does not match"), "{err}");
+        assert!(err.contains("'production'"), "{err}");
+    }
+
+    #[test]
+    fn test_protected_environment_demands_confirm_env_when_unattended() {
+        let err = confirm_protected_environment("production", None, false, blocked())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Pass --confirm-env production"), "{err}");
+    }
+
+    /// A manifest per entry, so the environment sees colliding service names.
+    fn env_with_manifests(dir: &std::path::Path, manifests: &[(&str, &str)]) -> Environment {
+        for (file, body) in manifests {
+            std::fs::write(dir.join(file), body).unwrap();
+        }
+
+        Environment {
+            name: "preprod".to_string(),
+            env_yaml_dir: dir.to_path_buf(),
+            env_yaml_dir_extra: Default::default(),
+            kubectl_context: "ctx".to_string(),
+            gcp_project: None,
+            protected: None,
+        }
+    }
+
+    fn manifest(name: &str, namespace: Option<&str>) -> String {
+        let namespace = namespace
+            .map(|ns| format!("\n  namespace: {ns}"))
+            .unwrap_or_default();
+        format!(
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: {name}{namespace}\nspec:\n  template:\n    spec:\n      containers:\n      - name: {name}\n        image: gcr.io/p/{name}:v1\n"
+        )
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_is_ordered_by_name_then_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(
+            dir.path(),
+            &[
+                ("c.yml", &manifest("svc-api", Some("tenant-b"))),
+                ("a.yml", &manifest("billing", Some("core"))),
+                ("b.yml", &manifest("svc-api", None)),
+            ],
+        );
+
+        let services = list_services_in_namespace(&env, None).unwrap();
+        let ordered: Vec<(&str, Option<&str>)> = services
+            .iter()
+            .map(|s| (s.name.as_str(), s.namespace.as_deref()))
+            .collect();
+
+        assert_eq!(
+            ordered,
+            vec![
+                ("billing", Some("core")),
+                ("svc-api", None),
+                ("svc-api", Some("tenant-b")),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_filters_and_disambiguates() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(
+            dir.path(),
+            &[
+                ("a.yml", &manifest("svc-api", Some("tenant-b"))),
+                ("b.yml", &manifest("svc-api", None)),
+            ],
+        );
+
+        let services = list_services_in_namespace(&env, Some("tenant-b")).unwrap();
+        assert_eq!(services.len(), 1);
+        // Once narrowed the name no longer collides, so --service takes it plain.
+        assert_eq!(get_service_display_name(&services[0], &services), "svc-api");
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_selects_manifests_declaring_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(
+            dir.path(),
+            &[
+                ("a.yml", &manifest("svc-api", Some("tenant-b"))),
+                ("b.yml", &manifest("svc-api", None)),
+                ("c.yml", &manifest("reports", None)),
+            ],
+        );
+
+        let services = list_services_in_namespace(&env, Some(NO_NAMESPACE)).unwrap();
+        let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+
+        assert_eq!(names, vec!["reports", "svc-api"]);
+        assert!(services.iter().all(|s| s.namespace.is_none()));
+    }
+
+    /// The NAMESPACE column and the --namespace filter must not drift apart.
+    #[test]
+    fn test_every_listed_namespace_is_accepted_by_the_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(
+            dir.path(),
+            &[
+                ("a.yml", &manifest("svc-api", Some("tenant-b"))),
+                ("b.yml", &manifest("svc-api", None)),
+                ("c.yml", &manifest("billing", Some("core"))),
+            ],
+        );
+
+        for service in list_services_in_namespace(&env, None).unwrap() {
+            let printed = namespace_label(&service).to_string();
+            assert!(
+                list_services_in_namespace(&env, Some(&printed)).is_ok(),
+                "listing printed '{printed}', which --namespace rejects"
+            );
+        }
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_reports_no_undeclared_namespace_distinctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(dir.path(), &[("a.yml", &manifest("billing", Some("core")))]);
+
+        let err = list_services_in_namespace(&env, Some(NO_NAMESPACE))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "No services without a declared namespace found");
+    }
+
+    #[test]
+    fn test_strip_namespace_suffix_accepts_both_spellings() {
+        let cases = [
+            // (printed by `list services`, --namespace, expected)
+            ("svc-api (tenant-b)", Some("tenant-b"), "svc-api"),
+            ("svc-api (no-namespace)", Some(NO_NAMESPACE), "svc-api"),
+            // Already plain, or no --namespace to narrow by: left alone.
+            ("svc-api", Some("tenant-b"), "svc-api"),
+            ("svc-api (tenant-b)", None, "svc-api (tenant-b)"),
+            // A suffix naming a different namespace is not the one we narrowed to.
+            ("svc-api (tenant-b)", Some("core"), "svc-api (tenant-b)"),
+            // The three-part form stays ambiguous inside the narrowed set too.
+            (
+                "svc-api (core) [main]/a.yml",
+                Some("core"),
+                "svc-api (core) [main]/a.yml",
+            ),
+        ];
+
+        for (value, namespace, expected) in cases {
+            assert_eq!(
+                strip_namespace_suffix(value.to_string(), namespace),
+                expected,
+                "{value} with --namespace {namespace:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_namespace_accepts_the_bare_sentinel() {
+        let parsed =
+            Cli::try_parse_from(["davit", "list", "services", "--namespace", NO_NAMESPACE])
+                .unwrap();
+        match parsed.command {
+            Commands::List {
+                command: ListCommands::Services { namespace, .. },
+            } => assert_eq!(namespace.as_deref(), Some(NO_NAMESPACE)),
+            _ => panic!("expected list services"),
+        }
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_rejects_an_empty_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(dir.path(), &[("a.yml", &manifest("billing", Some("core")))]);
+
+        let err = list_services_in_namespace(&env, Some("absent"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("No services found in namespace 'absent'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_no_fetch_skips_the_refresh_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(dir.path(), &[("a.yml", &manifest("billing", Some("core")))]);
+
+        // The directory is not a git repository, so a refresh fails and, with
+        // nobody to confirm the failure, aborts. --no-fetch never gets there.
+        assert!(pull_yaml_sources(&env, false, false, "listing", blocked()).is_err());
+        assert!(pull_yaml_sources(&env, false, true, "listing", blocked()).is_ok());
+    }
+
+    #[test]
+    fn test_pull_source_skips_a_dirty_working_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["init", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Untracked content is enough to make the working copy dirty.
+        std::fs::write(root.join("manifest.yml"), "kind: Deployment\n").unwrap();
+
+        let source = YamlSource {
+            name: "main".to_string(),
+            root: root.to_path_buf(),
+        };
+
+        let report = pull_source(&source, false).unwrap();
+        assert!(report.success);
+        assert!(
+            report.stdout.contains("uncommitted changes"),
+            "{}",
+            report.stdout
+        );
+    }
+
+    #[test]
+    fn test_pull_source_does_not_inspect_the_working_copy_in_dry_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = YamlSource {
+            name: "main".to_string(),
+            root: dir.path().to_path_buf(),
+        };
+
+        // Not a repository at all: reaching git status would fail.
+        let report = pull_source(&source, true).unwrap();
+        assert!(report.stdout.contains("Dry-run"), "{}", report.stdout);
+    }
+
+    #[test]
+    fn test_no_fetch_is_accepted_by_every_reading_command() {
+        assert!(Cli::try_parse_from(["davit", "deploy", "--no-fetch"]).is_ok());
+        assert!(Cli::try_parse_from(["davit", "info", "--no-fetch"]).is_ok());
+        assert!(Cli::try_parse_from(["davit", "list", "services", "--no-fetch"]).is_ok());
+    }
+
+    #[test]
+    fn test_deploy_accepts_a_namespace() {
+        let parse = Cli::try_parse_from([
+            "davit",
+            "deploy",
+            "--service",
+            "svc-api",
+            "--namespace",
+            "tenant-b",
+        ]);
+        assert!(parse.is_ok());
+    }
+
+    #[test]
+    fn test_list_subcommands_parse() {
+        assert!(Cli::try_parse_from(["davit", "list", "envs"]).is_ok());
+        assert!(Cli::try_parse_from(["davit", "list", "services", "--env", "preprod"]).is_ok());
+    }
+
+    #[test]
+    fn test_non_interactive_is_a_global_flag() {
+        assert!(
+            Cli::try_parse_from(["davit", "deploy", "--non-interactive"])
+                .unwrap()
+                .non_interactive
+        );
+        assert!(
+            Cli::try_parse_from(["davit", "--non-interactive", "info"])
+                .unwrap()
+                .non_interactive
+        );
+    }
+
+    #[test]
+    fn test_classify_kubectl_diff_result_in_sync() {
+        assert_eq!(
+            classify_kubectl_diff_result(Some(0), b"", b""),
+            RemoteManifestDiffCheck::InSync
+        );
+    }
+
+    #[test]
+    fn test_classify_kubectl_diff_result_detects_drift() {
+        assert_eq!(
+            classify_kubectl_diff_result(Some(1), b"diff body\n", b""),
+            RemoteManifestDiffCheck::Drift("diff body".to_string())
+        );
+    }
+
+    #[test]
+    fn test_classify_kubectl_diff_result_combines_stdout_and_stderr_on_failure() {
+        assert_eq!(
+            classify_kubectl_diff_result(Some(2), b"stdout\n", b"stderr\n"),
+            RemoteManifestDiffCheck::CheckFailed(
+                "kubectl diff exited with status 2.\nstdout\nstderr".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_classify_kubectl_diff_result_handles_missing_output() {
+        assert_eq!(
+            classify_kubectl_diff_result(Some(3), b"", b""),
+            RemoteManifestDiffCheck::CheckFailed(
+                "kubectl diff exited with status 3.\nNo output returned by kubectl diff."
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_terminal_width_truncates_with_ellipsis() {
+        assert_eq!(
+            truncate_for_terminal_width("1234567890", 8),
+            "1234...".to_string()
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_terminal_width_keeps_short_message() {
+        assert_eq!(
+            truncate_for_terminal_width("short", 10),
+            "short".to_string()
+        );
+    }
+
+    #[test]
+    fn test_truncate_for_terminal_width_reserves_last_terminal_column() {
+        let rendered = truncate_for_terminal_width("1234567890", 10);
+        assert_eq!(rendered.chars().count(), 9);
+        assert_eq!(rendered, "123456...".to_string());
     }
 
     #[test]

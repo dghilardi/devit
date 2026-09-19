@@ -31,6 +31,27 @@ impl Git {
             .unwrap_or(false)
     }
 
+    /// Reports whether the working copy has uncommitted changes.
+    pub fn is_dirty(path: &Path) -> Result<bool> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("status")
+            .arg("--porcelain")
+            .output()
+            .context("Failed to execute git status")?;
+
+        if !output.status.success() {
+            return Err(anyhow::anyhow!(
+                "git status failed for {}: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        Ok(!output.stdout.is_empty())
+    }
+
     /// Performs a git pull.
     pub fn pull(path: &Path, dry_run: bool) -> Result<GitPullReport> {
         if dry_run {
