@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `deploy --dry-run` no longer reaches any interactive prompt: the protected-environment confirmation, the diff approval, the rollout dashboard and the commit confirmation are all skipped, so a dry run now completes without a terminal.
+
 ### Changed
 - Added a pre-apply remote alignment check during `deploy` using `kubectl diff`, warning with the live diff and asking for confirmation before continuing when the selected manifest has drifted from the cluster.
 

@@ -158,15 +158,19 @@ async fn main() -> Result<()> {
                     "⚠️  WARNING: Deployment to {} is PROTECTED!",
                     selected_env.name
                 );
-                let confirmation = Text::new(&format!(
-                    "Type the environment name '{}' to confirm:",
-                    selected_env.name
-                ))
-                .prompt()
-                .context("Production confirmation was cancelled")?;
+                if dry_run {
+                    println!("Dry-run: skipping the protected environment confirmation.");
+                } else {
+                    let confirmation = Text::new(&format!(
+                        "Type the environment name '{}' to confirm:",
+                        selected_env.name
+                    ))
+                    .prompt()
+                    .context("Production confirmation was cancelled")?;
 
-                if confirmation != selected_env.name {
-                    return Err(anyhow::anyhow!("Confirmation failed. Deployment aborted."));
+                    if confirmation != selected_env.name {
+                        return Err(anyhow::anyhow!("Confirmation failed. Deployment aborted."));
+                    }
                 }
             }
 
@@ -195,17 +199,18 @@ async fn main() -> Result<()> {
             loop {
                 Blueprint::show_diff(&original_content, &updated_content, filename, show_unified);
 
+                if dry_run {
+                    println!(
+                        "Dry-run: would write updated YAML to {}",
+                        yaml_path.display()
+                    );
+                    break;
+                }
+
                 if auto_apply {
-                    if dry_run {
-                        println!(
-                            "Dry-run: would write updated YAML to {}",
-                            yaml_path.display()
-                        );
-                    } else {
-                        fs::write(&yaml_path, &updated_content).with_context(|| {
-                            format!("Failed to write updated YAML to {}", yaml_path.display())
-                        })?;
-                    }
+                    fs::write(&yaml_path, &updated_content).with_context(|| {
+                        format!("Failed to write updated YAML to {}", yaml_path.display())
+                    })?;
                     println!("Auto-apply enabled. Local YAML updated. Executing kubectl apply...");
                     break;
                 }
@@ -220,16 +225,9 @@ async fn main() -> Result<()> {
 
                 match selection {
                     "Apply" => {
-                        if dry_run {
-                            println!(
-                                "Dry-run: would write updated YAML to {}",
-                                yaml_path.display()
-                            );
-                        } else {
-                            fs::write(&yaml_path, &updated_content).with_context(|| {
-                                format!("Failed to write updated YAML to {}", yaml_path.display())
-                            })?;
-                        }
+                        fs::write(&yaml_path, &updated_content).with_context(|| {
+                            format!("Failed to write updated YAML to {}", yaml_path.display())
+                        })?;
                         println!("Local YAML updated. Executing kubectl apply...");
                         break;
                     }
@@ -276,45 +274,52 @@ async fn main() -> Result<()> {
                 }
             }
 
-            println!("Deployment applied. Starting dashboard...");
+            if dry_run {
+                println!(
+                    "Dry-run: would monitor the rollout of {} in the dashboard.",
+                    selected_service.name
+                );
+            } else {
+                println!("Deployment applied. Starting dashboard...");
 
-            let mut dashboard = Dashboard::new(
-                selected_service.name.clone(),
-                selected_service.kind.clone(),
-                selected_env.name.clone(),
-                selected_tag.clone(),
-                selected_env.kubectl_context.clone(),
-                selected_service.namespace.clone(),
-                selected_service.selector.clone(),
-                selected_service.container_name.clone(),
-                auto_continue,
-            );
-            let res = dashboard.run().await;
+                let mut dashboard = Dashboard::new(
+                    selected_service.name.clone(),
+                    selected_service.kind.clone(),
+                    selected_env.name.clone(),
+                    selected_tag.clone(),
+                    selected_env.kubectl_context.clone(),
+                    selected_service.namespace.clone(),
+                    selected_service.selector.clone(),
+                    selected_service.container_name.clone(),
+                    auto_continue,
+                );
+                let res = dashboard.run().await;
 
-            match res {
-                Err(e) => {
-                    println!("❌ Dashboard error or aborted: {}", e);
-                    if !auto_continue {
-                        if Confirm::new("Revert local YAML changes?")
-                            .with_default(true)
-                            .prompt()?
-                        {
-                            fs::write(&yaml_path, &original_content)?;
-                            println!("YAML reverted.");
+                match res {
+                    Err(e) => {
+                        println!("❌ Dashboard error or aborted: {}", e);
+                        if !auto_continue {
+                            if Confirm::new("Revert local YAML changes?")
+                                .with_default(true)
+                                .prompt()?
+                            {
+                                fs::write(&yaml_path, &original_content)?;
+                                println!("YAML reverted.");
+                            }
                         }
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-                Ok(DashboardExit::UserQuit) => {
-                    if auto_continue {
-                        return Err(anyhow::anyhow!(
-                            "Dashboard closed before rollout completion in auto-continue mode"
-                        ));
+                    Ok(DashboardExit::UserQuit) => {
+                        if auto_continue {
+                            return Err(anyhow::anyhow!(
+                                "Dashboard closed before rollout completion in auto-continue mode"
+                            ));
+                        }
+                        println!("Dashboard closed before rollout completion check.");
                     }
-                    println!("Dashboard closed before rollout completion check.");
-                }
-                Ok(DashboardExit::RolloutCompleted) => {
-                    println!("Rollout completed. Continuing to the Git step...");
+                    Ok(DashboardExit::RolloutCompleted) => {
+                        println!("Rollout completed. Continuing to the Git step...");
+                    }
                 }
             }
 
@@ -331,7 +336,7 @@ async fn main() -> Result<()> {
             Blueprint::show_diff(&original_content, &updated_content, filename, true);
             println!("--------------------\n");
 
-            if auto_continue {
+            if auto_continue || dry_run {
                 Git::commit_and_push(
                     &selected_service.source_root,
                     &commit_msg,
