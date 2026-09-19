@@ -83,6 +83,11 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
+        /// Read the YAML sources as they are on disk, without running git pull first
+        #[arg(long)]
+        no_fetch: bool,
+
+
         /// Apply the selected version immediately and continue automatically through rollout and Git steps
         #[arg(long)]
         auto_apply: bool,
@@ -108,6 +113,10 @@ enum Commands {
         /// Service name to inspect
         #[arg(short, long)]
         service: Option<String>,
+
+        /// Read the YAML sources as they are on disk, without running git pull first
+        #[arg(long)]
+        no_fetch: bool,
     },
     /// List the identifiers accepted by --env and --service
     List {
@@ -134,6 +143,10 @@ enum ListCommands {
         /// Only list services declared in this namespace
         #[arg(short, long)]
         namespace: Option<String>,
+
+        /// Read the YAML sources as they are on disk, without running git pull first
+        #[arg(long)]
+        no_fetch: bool,
     },
 }
 
@@ -159,6 +172,7 @@ async fn main() -> Result<()> {
             tag,
             wait_for_tag,
             dry_run,
+            no_fetch,
             auto_apply,
             auto_continue,
             confirm_env,
@@ -166,7 +180,7 @@ async fn main() -> Result<()> {
             let auto_continue = auto_continue || auto_apply;
             let selected_env = resolve_environment(&config, env, policy)?;
 
-            pull_yaml_sources(&selected_env, dry_run, "deployment", policy)?;
+            pull_yaml_sources(&selected_env, dry_run, no_fetch, "deployment", policy)?;
 
             let selected_service =
                 resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
@@ -390,10 +404,11 @@ async fn main() -> Result<()> {
             env,
             namespace,
             service,
+            no_fetch,
         } => {
             let selected_env = resolve_environment(&config, env, policy)?;
 
-            pull_yaml_sources(&selected_env, false, "info", policy)?;
+            pull_yaml_sources(&selected_env, false, no_fetch, "info", policy)?;
 
             let selected_service =
                 resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
@@ -410,10 +425,14 @@ async fn main() -> Result<()> {
                     println!("{}{}", environment.name, protected);
                 }
             }
-            ListCommands::Services { env, namespace } => {
+            ListCommands::Services {
+                env,
+                namespace,
+                no_fetch,
+            } => {
                 let selected_env = resolve_environment(&config, env, policy)?;
 
-                pull_yaml_sources(&selected_env, false, "listing", policy)?;
+                pull_yaml_sources(&selected_env, false, no_fetch, "listing", policy)?;
 
                 let services =
                     list_services_in_namespace(&selected_env, namespace.as_deref())?;
@@ -635,9 +654,15 @@ fn get_service_source_display_path(service: &ServiceSource) -> String {
 fn pull_yaml_sources(
     env: &Environment,
     dry_run: bool,
+    no_fetch: bool,
     action: &str,
     policy: PromptPolicy,
 ) -> Result<()> {
+    if no_fetch {
+        println!("Skipping the YAML source refresh (--no-fetch); reading manifests from disk.");
+        return Ok(());
+    }
+
     let sources = unique_yaml_sources(env);
 
     if sources.is_empty() {
@@ -1683,6 +1708,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("No services found in namespace 'absent'"), "{err}");
+    }
+
+    #[test]
+    fn test_no_fetch_skips_the_refresh_entirely() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(dir.path(), &[("a.yml", &manifest("billing", Some("core")))]);
+
+        // The directory is not a git repository, so a refresh fails and, with
+        // nobody to confirm the failure, aborts. --no-fetch never gets there.
+        assert!(pull_yaml_sources(&env, false, false, "listing", blocked()).is_err());
+        assert!(pull_yaml_sources(&env, false, true, "listing", blocked()).is_ok());
+    }
+
+    #[test]
+    fn test_no_fetch_is_accepted_by_every_reading_command() {
+        assert!(Cli::try_parse_from(["davit", "deploy", "--no-fetch"]).is_ok());
+        assert!(Cli::try_parse_from(["davit", "info", "--no-fetch"]).is_ok());
+        assert!(Cli::try_parse_from(["davit", "list", "services", "--no-fetch"]).is_ok());
     }
 
     #[test]
