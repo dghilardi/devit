@@ -277,7 +277,10 @@ impl Dashboard {
 
                                             // Attempt JSON parsing only when the line looks like JSON.
                                             if raw_content.starts_with('{')
-                                                && let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_content)
+                                                && let Ok(v) =
+                                                    serde_json::from_str::<serde_json::Value>(
+                                                        raw_content,
+                                                    )
                                             {
                                                 // Extract level - GKE uses 'severity', others 'level'
                                                 log_line.level = v
@@ -522,12 +525,13 @@ impl Dashboard {
                 ListItem::new(l.as_str()).style(style)
             })
             .collect();
-        let old_list = List::new(old_logs).block(
-            Block::default()
-                .title(" Old Pod Logs ")
-                .borders(Borders::ALL),
-        )
-        .direction(ListDirection::BottomToTop);
+        let old_list = List::new(old_logs)
+            .block(
+                Block::default()
+                    .title(" Old Pod Logs ")
+                    .borders(Borders::ALL),
+            )
+            .direction(ListDirection::BottomToTop);
         f.render_widget(old_list, log_chunks[0]);
 
         let new_logs: Vec<ListItem> = self
@@ -540,12 +544,13 @@ impl Dashboard {
                 ListItem::new(l.as_str()).style(style)
             })
             .collect();
-        let new_list = List::new(new_logs).block(
-            Block::default()
-                .title(" New Pod Logs ")
-                .borders(Borders::ALL),
-        )
-        .direction(ListDirection::BottomToTop);
+        let new_list = List::new(new_logs)
+            .block(
+                Block::default()
+                    .title(" New Pod Logs ")
+                    .borders(Borders::ALL),
+            )
+            .direction(ListDirection::BottomToTop);
         f.render_widget(new_list, log_chunks[1]);
 
         if self.completion_modal_visible {
@@ -559,7 +564,10 @@ impl Dashboard {
         let available_height = total_height.saturating_sub(HEADER_HEIGHT);
         let max_pod_height = available_height.saturating_sub(LOG_PANEL_MIN_HEIGHT);
 
-        clamped_height.clamp(POD_PANEL_MIN_HEIGHT, max_pod_height.max(POD_PANEL_MIN_HEIGHT))
+        clamped_height.clamp(
+            POD_PANEL_MIN_HEIGHT,
+            max_pod_height.max(POD_PANEL_MIN_HEIGHT),
+        )
     }
 
     fn update_rollout_modal_state(&mut self) {

@@ -480,10 +480,7 @@ fn resolve_environment(
         .context("Environment not found in config")
 }
 
-fn get_service_display_name(
-    s: &ServiceSource,
-    all_services: &[ServiceSource],
-) -> String {
+fn get_service_display_name(s: &ServiceSource, all_services: &[ServiceSource]) -> String {
     let duplicates: Vec<&ServiceSource> = all_services
         .iter()
         .filter(|&other| other.name == s.name)
@@ -1305,8 +1302,12 @@ fn render_tag_wait_status(
 }
 
 fn clear_tag_wait_status_line() -> Result<()> {
-    crossterm::execute!(io::stdout(), MoveToColumn(0), Clear(ClearType::FromCursorDown))
-        .context("Failed to refresh tag wait status line")?;
+    crossterm::execute!(
+        io::stdout(),
+        MoveToColumn(0),
+        Clear(ClearType::FromCursorDown)
+    )
+    .context("Failed to refresh tag wait status line")?;
     Ok(())
 }
 
@@ -1337,7 +1338,8 @@ struct RawModeGuard;
 
 impl RawModeGuard {
     fn new() -> Result<Self> {
-        enable_raw_mode().context("Failed to enable terminal raw mode while waiting for image tag")?;
+        enable_raw_mode()
+            .context("Failed to enable terminal raw mode while waiting for image tag")?;
         Ok(Self)
     }
 }

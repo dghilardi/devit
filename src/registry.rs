@@ -172,11 +172,7 @@ impl Registry {
                         })
                         .unwrap_or_default();
 
-                    let update_time: DateTime<Utc> = v
-                        .get("updateTime")?
-                        .as_str()?
-                        .parse()
-                        .ok()?;
+                    let update_time: DateTime<Utc> = v.get("updateTime")?.as_str()?.parse().ok()?;
 
                     // name is nested under metadata.name
                     let name = v
@@ -185,7 +181,11 @@ impl Registry {
                         .and_then(|n| n.as_str())
                         .map(|s| s.to_string())?;
 
-                    Some(ImageMetadata { tags, update_time, name })
+                    Some(ImageMetadata {
+                        tags,
+                        update_time,
+                        name,
+                    })
                 })
                 .collect();
 

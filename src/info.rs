@@ -734,10 +734,15 @@ fn print_info(info: &ServiceInfo, service: &ServiceSource, env: &Environment) {
     if info.image_comparison.drift {
         println!(
             "  Status:   {}",
-            style("DIFF: cluster image does not match YAML").yellow().bold()
+            style("DIFF: cluster image does not match YAML")
+                .yellow()
+                .bold()
         );
     } else {
-        println!("  Status:   {}", style("OK: cluster and YAML are aligned").green());
+        println!(
+            "  Status:   {}",
+            style("OK: cluster and YAML are aligned").green()
+        );
     }
     println!();
 

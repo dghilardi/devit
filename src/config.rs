@@ -48,10 +48,14 @@ impl Environment {
             root: self.env_yaml_dir.clone(),
         }];
 
-        sources.extend(self.env_yaml_dir_extra.iter().map(|(name, root)| YamlSource {
-            name: name.clone(),
-            root: root.clone(),
-        }));
+        sources.extend(
+            self.env_yaml_dir_extra
+                .iter()
+                .map(|(name, root)| YamlSource {
+                    name: name.clone(),
+                    root: root.clone(),
+                }),
+        );
 
         sources
     }
