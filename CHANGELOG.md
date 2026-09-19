@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] 2026-09-19
+
 ### Added
 - Added a global `--non-interactive` flag, also inferred when stdin is not a terminal, that never prompts and instead fails naming the decision it could not ask and the valid values to supply. Ambiguous `--service`, `--env` and `--tag` values now list their candidates instead of surfacing `The input device is not a TTY`.
 - Added `davit list envs` and `davit list services`, so the exact values accepted by `--env` and `--service` can be discovered instead of guessed. Services are now listed in a stable order.
