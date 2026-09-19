@@ -34,6 +34,10 @@ const MAX_PARALLEL_PULLS: usize = 5;
 const TAG_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 const TAG_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TAG_WAIT_CANCELLED_MESSAGE: &str = "__TAG_WAIT_CANCELLED__";
+/// Stands for "declares no namespace of its own", in the NAMESPACE column and
+/// in `--namespace` alike, so the listing round-trips. A lone `-` cannot
+/// collide with a real namespace: those must start and end alphanumerically.
+const NO_NAMESPACE: &str = "-";
 
 #[derive(Debug, PartialEq, Eq)]
 enum RemoteManifestDiffCheck {
@@ -67,8 +71,8 @@ enum Commands {
         #[arg(short, long)]
         service: Option<String>,
 
-        /// Kubernetes namespace, to disambiguate a service name declared in several namespaces
-        #[arg(short, long)]
+        /// Kubernetes namespace, or `-` for manifests that declare none, to disambiguate a service name
+        #[arg(short, long, allow_hyphen_values = true)]
         namespace: Option<String>,
 
         /// Image tag to deploy
@@ -105,8 +109,8 @@ enum Commands {
         #[arg(short, long)]
         env: Option<String>,
 
-        /// Kubernetes namespace filter
-        #[arg(short, long)]
+        /// Kubernetes namespace filter, or `-` for manifests that declare none
+        #[arg(short, long, allow_hyphen_values = true)]
         namespace: Option<String>,
 
         /// Service name to inspect
@@ -139,8 +143,8 @@ enum ListCommands {
         #[arg(short, long)]
         env: Option<String>,
 
-        /// Only list services declared in this namespace
-        #[arg(short, long)]
+        /// Only list services in this namespace, or `-` for those that declare none
+        #[arg(short, long, allow_hyphen_values = true)]
         namespace: Option<String>,
 
         /// Read the YAML sources as they are on disk, without running git pull first
@@ -528,10 +532,14 @@ fn list_services_in_namespace(
         Some(ns) => {
             let filtered: Vec<ServiceSource> = all_services
                 .into_iter()
-                .filter(|s| s.namespace.as_deref() == Some(ns))
+                .filter(|service| namespace_label(service) == ns)
                 .collect();
             if filtered.is_empty() {
-                return Err(anyhow::anyhow!("No services found in namespace '{}'", ns));
+                return Err(if ns == NO_NAMESPACE {
+                    anyhow::anyhow!("No services without a declared namespace found")
+                } else {
+                    anyhow::anyhow!("No services found in namespace '{}'", ns)
+                });
             }
             filtered
         }
@@ -555,7 +563,31 @@ fn resolve_service_with_ns_filter(
     policy: PromptPolicy,
 ) -> Result<ServiceSource> {
     let services = list_services_in_namespace(env, namespace.as_deref())?;
+    let input = input.map(|value| strip_namespace_suffix(value, namespace.as_deref()));
     resolve_service_from_list(services, env, input, policy)
+}
+
+/// Drops the `(namespace)` suffix from a service name already narrowed by `--namespace`.
+///
+/// `list services` disambiguates names across the whole environment, so it
+/// prints `svc-api (tenant-b)`. Passing that back together with the NAMESPACE
+/// column would otherwise fail, because within the narrowed set the name no
+/// longer collides and is rendered plain.
+fn strip_namespace_suffix(value: String, namespace: Option<&str>) -> String {
+    let Some(namespace) = namespace else {
+        return value;
+    };
+
+    let rendered = if namespace == NO_NAMESPACE {
+        "no-namespace"
+    } else {
+        namespace
+    };
+
+    match value.strip_suffix(&format!(" ({})", rendered)) {
+        Some(stripped) => stripped.to_string(),
+        None => value,
+    }
 }
 
 fn resolve_service_from_list(
@@ -637,7 +669,7 @@ fn print_service_list(services: &[ServiceSource]) {
 
 /// The namespace as the manifest declares it; `--namespace` matches this value.
 fn namespace_label(service: &ServiceSource) -> &str {
-    service.namespace.as_deref().unwrap_or("-")
+    service.namespace.as_deref().unwrap_or(NO_NAMESPACE)
 }
 
 fn get_service_source_display_path(service: &ServiceSource) -> String {
@@ -1704,6 +1736,99 @@ mod tests {
         assert_eq!(services.len(), 1);
         // Once narrowed the name no longer collides, so --service takes it plain.
         assert_eq!(get_service_display_name(&services[0], &services), "svc-api");
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_selects_manifests_declaring_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(
+            dir.path(),
+            &[
+                ("a.yml", &manifest("svc-api", Some("tenant-b"))),
+                ("b.yml", &manifest("svc-api", None)),
+                ("c.yml", &manifest("reports", None)),
+            ],
+        );
+
+        let services = list_services_in_namespace(&env, Some(NO_NAMESPACE)).unwrap();
+        let names: Vec<&str> = services.iter().map(|s| s.name.as_str()).collect();
+
+        assert_eq!(names, vec!["reports", "svc-api"]);
+        assert!(services.iter().all(|s| s.namespace.is_none()));
+    }
+
+    /// The NAMESPACE column and the --namespace filter must not drift apart.
+    #[test]
+    fn test_every_listed_namespace_is_accepted_by_the_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(
+            dir.path(),
+            &[
+                ("a.yml", &manifest("svc-api", Some("tenant-b"))),
+                ("b.yml", &manifest("svc-api", None)),
+                ("c.yml", &manifest("billing", Some("core"))),
+            ],
+        );
+
+        for service in list_services_in_namespace(&env, None).unwrap() {
+            let printed = namespace_label(&service).to_string();
+            assert!(
+                list_services_in_namespace(&env, Some(&printed)).is_ok(),
+                "listing printed '{printed}', which --namespace rejects"
+            );
+        }
+    }
+
+    #[test]
+    fn test_list_services_in_namespace_reports_no_undeclared_namespace_distinctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = env_with_manifests(dir.path(), &[("a.yml", &manifest("billing", Some("core")))]);
+
+        let err = list_services_in_namespace(&env, Some(NO_NAMESPACE))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "No services without a declared namespace found");
+    }
+
+    #[test]
+    fn test_strip_namespace_suffix_accepts_both_spellings() {
+        let cases = [
+            // (printed by `list services`, --namespace, expected)
+            ("svc-api (tenant-b)", Some("tenant-b"), "svc-api"),
+            ("svc-api (no-namespace)", Some(NO_NAMESPACE), "svc-api"),
+            // Already plain, or no --namespace to narrow by: left alone.
+            ("svc-api", Some("tenant-b"), "svc-api"),
+            ("svc-api (tenant-b)", None, "svc-api (tenant-b)"),
+            // A suffix naming a different namespace is not the one we narrowed to.
+            ("svc-api (tenant-b)", Some("core"), "svc-api (tenant-b)"),
+            // The three-part form stays ambiguous inside the narrowed set too.
+            (
+                "svc-api (core) [main]/a.yml",
+                Some("core"),
+                "svc-api (core) [main]/a.yml",
+            ),
+        ];
+
+        for (value, namespace, expected) in cases {
+            assert_eq!(
+                strip_namespace_suffix(value.to_string(), namespace),
+                expected,
+                "{value} with --namespace {namespace:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_namespace_accepts_the_bare_sentinel() {
+        let parsed =
+            Cli::try_parse_from(["davit", "list", "services", "--namespace", NO_NAMESPACE])
+                .unwrap();
+        match parsed.command {
+            Commands::List {
+                command: ListCommands::Services { namespace, .. },
+            } => assert_eq!(namespace.as_deref(), Some(NO_NAMESPACE)),
+            _ => panic!("expected list services"),
+        }
     }
 
     #[test]

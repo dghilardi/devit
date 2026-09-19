@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Added `--no-fetch` to `deploy`, `info` and `list services`, so a query can read the manifests as they are on disk instead of running `git pull` across every configured YAML source first.
 - Added `davit list envs` and `davit list services`, so the exact values accepted by `--env` and `--service` can be discovered instead of guessed. Services are now listed in a stable order.
-- Added `deploy --namespace`, matching the option `info` already had, so a service name declared in several namespaces can be selected without passing a rendered display name.
+- Added `deploy --namespace`, matching the option `info` already had, so a service name declared in several namespaces can be selected without passing a rendered display name. `--namespace -` selects the manifests that declare no namespace, mirroring the `-` shown in the listing.
 - Added a global `--non-interactive` flag, also inferred when stdin is not a terminal, that never prompts and instead fails naming the decision it could not ask and the valid values to supply. Ambiguous `--service`, `--env` and `--tag` values now list their candidates instead of surfacing `The input device is not a TTY`.
 - Added `deploy --confirm-env <NAME>`, the explicit opt-in that replaces the typed confirmation when deploying to a protected environment without a terminal.
 

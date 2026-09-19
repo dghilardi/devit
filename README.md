@@ -92,6 +92,9 @@ Use `davit list services` to discover those values, or `--namespace` to narrow t
 # Unambiguous without quoting a rendered display name
 davit deploy --env preprod --service svc-api --namespace tenant-b --tag v1.2.3
 
+# `-` selects the manifests that declare no namespace, as the listing shows them
+davit deploy --env preprod --service svc-api --namespace - --tag v1.2.3
+
 # Protected environments take an explicit opt-in instead of the typed confirmation
 davit deploy --env production --service auth-api --tag v1.2.3 \
   --non-interactive --confirm-env production
