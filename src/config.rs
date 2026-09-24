@@ -6,6 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::helm::discover_helm_services;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub environments: Vec<Environment>,
@@ -14,18 +16,37 @@ pub struct Config {
 #[derive(Debug, Deserialize, Clone)]
 pub struct Environment {
     pub name: String,
+    #[serde(default)]
     pub env_yaml_dir: PathBuf,
     #[serde(default)]
     pub env_yaml_dir_extra: BTreeMap<String, PathBuf>,
     pub kubectl_context: String,
     pub gcp_project: Option<String>,
     pub protected: Option<bool>,
+    #[serde(default)]
+    pub deployment_driver: DeploymentDriver,
+    pub helm_cluster: Option<String>,
+    #[serde(default)]
+    pub sources: Vec<YamlSource>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeploymentDriver {
+    #[default]
+    Manifest,
+    Helm,
+    ArgoCd,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 pub struct YamlSource {
     pub name: String,
+    #[serde(rename = "repo_root")]
     pub root: PathBuf,
+    #[serde(rename = "type", default)]
+    pub driver: DeploymentDriver,
+    pub helm_cluster: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -39,14 +60,30 @@ pub struct ServiceSource {
     pub yaml_path: std::path::PathBuf,
     pub namespace: Option<String>,
     pub selector: Option<String>,
+    pub deployment_driver: DeploymentDriver,
+    pub helm: Option<HelmServiceSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HelmServiceSource {
+    pub application_name: String,
+    pub chart_path: PathBuf,
+    pub values_path: PathBuf,
+    pub image_tag_path: Vec<String>,
 }
 
 impl Environment {
     pub fn yaml_sources(&self) -> Vec<YamlSource> {
-        let mut sources = vec![YamlSource {
-            name: "main".to_string(),
-            root: self.env_yaml_dir.clone(),
-        }];
+        let mut sources = Vec::new();
+
+        if !self.env_yaml_dir.as_os_str().is_empty() {
+            sources.push(YamlSource {
+                name: "main".to_string(),
+                root: self.env_yaml_dir.clone(),
+                driver: self.deployment_driver,
+                helm_cluster: self.helm_cluster.clone(),
+            });
+        }
 
         sources.extend(
             self.env_yaml_dir_extra
@@ -54,8 +91,12 @@ impl Environment {
                 .map(|(name, root)| YamlSource {
                     name: name.clone(),
                     root: root.clone(),
+                    driver: DeploymentDriver::Manifest,
+                    helm_cluster: None,
                 }),
         );
+
+        sources.extend(self.sources.iter().cloned());
 
         sources
     }
@@ -65,6 +106,11 @@ impl Environment {
 
         for source in self.yaml_sources() {
             if !source.root.exists() {
+                continue;
+            }
+
+            if source.driver != DeploymentDriver::Manifest {
+                services.extend(discover_helm_services(&source)?);
                 continue;
             }
 
@@ -164,6 +210,8 @@ impl Environment {
                     yaml_path: yaml_path.to_path_buf(),
                     namespace,
                     selector,
+                    deployment_driver: source.driver,
+                    helm: None,
                 });
             }
         }
@@ -253,6 +301,17 @@ impl Config {
 
 impl Environment {
     fn validate(&self) -> Result<()> {
+        if !self.env_yaml_dir.as_os_str().is_empty()
+            && self.deployment_driver != DeploymentDriver::Manifest
+            && self.helm_cluster.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow::anyhow!(
+                "Environment '{}' uses deployment_driver '{:?}' but does not define helm_cluster",
+                self.name,
+                self.deployment_driver
+            ));
+        }
+
         if self.env_yaml_dir_extra.contains_key("main") {
             return Err(anyhow::anyhow!(
                 "Environment '{}' uses reserved extra source name 'main'",
@@ -260,8 +319,37 @@ impl Environment {
             ));
         }
 
+        if self.yaml_sources().is_empty() {
+            return Err(anyhow::anyhow!(
+                "Environment '{}' does not define any deployment sources",
+                self.name
+            ));
+        }
+
         let mut seen_paths = HashSet::new();
+        let mut seen_names = HashSet::new();
         for source in self.yaml_sources() {
+            if !seen_names.insert(source.name.clone()) {
+                return Err(anyhow::anyhow!(
+                    "Environment '{}' defines duplicate source name '{}'",
+                    self.name,
+                    source.name
+                ));
+            }
+            if source.driver != DeploymentDriver::Manifest
+                && source
+                    .helm_cluster
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Source '{}' in environment '{}' uses driver '{:?}' but does not define helm_cluster",
+                    source.name,
+                    self.name,
+                    source.driver
+                ));
+            }
             let normalized = normalize_source_path(&source.root);
             if !seen_paths.insert(normalized.clone()) {
                 return Err(anyhow::anyhow!(
@@ -377,6 +465,9 @@ spec:
             kubectl_context: "test".to_string(),
             gcp_project: None,
             protected: None,
+            deployment_driver: DeploymentDriver::Manifest,
+            helm_cluster: None,
+            sources: Vec::new(),
         };
 
         let services = env.list_services()?;
@@ -468,6 +559,9 @@ spec:
             kubectl_context: "test".to_string(),
             gcp_project: None,
             protected: None,
+            deployment_driver: DeploymentDriver::Manifest,
+            helm_cluster: None,
+            sources: Vec::new(),
         };
 
         let services = env.list_services()?;
@@ -485,6 +579,124 @@ spec:
             .expect("demo source service");
         assert_eq!(demo_service.source_root, extra_yaml_dir);
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_environment_accepts_mixed_deployment_sources() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+[[environments]]
+name = "preprod"
+kubectl_context = "cluster-preprod"
+
+[[environments.sources]]
+name = "legacy"
+type = "manifest"
+repo_root = "/repos/legacy/preprod"
+
+[[environments.sources]]
+name = "helm"
+type = "argo-cd"
+repo_root = "/repos/helm"
+helm_cluster = "ccs-preprod"
+"#,
+        )?;
+        config.validate()?;
+
+        let sources = config.environments[0].yaml_sources();
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0].name, "legacy");
+        assert_eq!(sources[0].driver, DeploymentDriver::Manifest);
+        assert_eq!(sources[1].name, "helm");
+        assert_eq!(sources[1].driver, DeploymentDriver::ArgoCd);
+        assert_eq!(sources[1].helm_cluster.as_deref(), Some("ccs-preprod"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_legacy_environment_becomes_an_implicit_source() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+[[environments]]
+name = "staging"
+env_yaml_dir = "/repos/legacy/staging"
+kubectl_context = "cluster-staging"
+"#,
+        )?;
+        config.validate()?;
+
+        let sources = config.environments[0].yaml_sources();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "main");
+        assert_eq!(sources[0].driver, DeploymentDriver::Manifest);
+        assert_eq!(sources[0].root, PathBuf::from("/repos/legacy/staging"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_services_aggregates_manifest_and_helm_sources() -> Result<()> {
+        let directory = tempdir()?;
+        let legacy = directory.path().join("legacy");
+        let helm = directory.path().join("helm");
+        fs::create_dir_all(&legacy)?;
+        fs::create_dir_all(helm.join("clusters/test/apps"))?;
+        fs::create_dir_all(helm.join("clusters/test/values"))?;
+        fs::create_dir_all(helm.join("charts/auth"))?;
+        fs::write(
+            legacy.join("billing.yaml"),
+            "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: billing\nspec:\n  template:\n    spec:\n      containers:\n        - name: billing\n          image: gcr.io/project/billing:1.0.0\n",
+        )?;
+        fs::write(
+            helm.join("clusters/test/apps/auth.yaml"),
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: auth\nspec:\n  sources:\n    - path: charts/auth\n      helm:\n        valueFiles:\n          - $values/clusters/test/values/auth.yaml\n    - ref: values\n  destination:\n    namespace: default\n",
+        )?;
+        fs::write(
+            helm.join("charts/auth/values.yaml"),
+            "image:\n  repository: gcr.io/project/auth\n  tag: default\n",
+        )?;
+        fs::write(
+            helm.join("clusters/test/values/auth.yaml"),
+            "image:\n  tag: 2.0.0\n",
+        )?;
+
+        let environment = Environment {
+            name: "test".to_string(),
+            env_yaml_dir: PathBuf::new(),
+            env_yaml_dir_extra: BTreeMap::new(),
+            kubectl_context: "test".to_string(),
+            gcp_project: None,
+            protected: None,
+            deployment_driver: DeploymentDriver::Manifest,
+            helm_cluster: None,
+            sources: vec![
+                YamlSource {
+                    name: "legacy".to_string(),
+                    root: legacy,
+                    driver: DeploymentDriver::Manifest,
+                    helm_cluster: None,
+                },
+                YamlSource {
+                    name: "helm".to_string(),
+                    root: helm,
+                    driver: DeploymentDriver::ArgoCd,
+                    helm_cluster: Some("test".to_string()),
+                },
+            ],
+        };
+
+        let services = environment.list_services()?;
+        assert_eq!(services.len(), 2);
+        assert!(services.iter().any(|service| {
+            service.name == "billing"
+                && service.source_name == "legacy"
+                && service.deployment_driver == DeploymentDriver::Manifest
+        }));
+        assert!(services.iter().any(|service| {
+            service.name == "auth"
+                && service.source_name == "helm"
+                && service.deployment_driver == DeploymentDriver::ArgoCd
+        }));
         Ok(())
     }
 }

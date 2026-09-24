@@ -1,6 +1,7 @@
 # Davit
 
-A safe Kubernetes deployment wrapper and TUI built with Rust.
+A safe Kubernetes release orchestrator and TUI built with Rust. Davit supports both legacy
+Kubernetes manifests and Helm releases managed directly or through ArgoCD.
 
 ## 🚢 What is a Davit?
 
@@ -13,7 +14,8 @@ In maritime terms, a **davit** is a crane-like device used to safely lower lifeb
     -   **Wizard Mode:** Interactive selection of environments, services, and image tags (`inquire`).
     -   **Dashboard Mode:** Real-time rollout monitoring with split-screen logs (`ratatui`).
 -   **Visual Diffs:** Preview infrastructure YAML changes before applying them.
--   **Automated Auditing:** Automatically commits and pushes changes to Git upon successful deployment.
+-   **Helm & GitOps:** Discover ArgoCD Applications, update environment values, validate/render charts, and release through Helm or ArgoCD.
+-   **Automated Auditing:** Keeps the release state in Git; Helm changes are committed before deployment, while legacy manifests retain their post-rollout commit flow.
 -   **Deployment Info:** Inspect deployed services with `davit info` - refreshes the YAML sources (unless `--no-fetch` is passed), reads live workload state from cluster, and shows YAML vs cluster image drift together with workload status, current image version, last release commit, labels, pod details, resource usage, and recent events.
 -   **Scriptable:** `--non-interactive` never prompts and fails naming the decision it could not ask, so Davit can be driven from CI or an agent.
 
@@ -25,6 +27,8 @@ In maritime terms, a **davit** is a crane-like device used to safely lower lifeb
 -   `kubectl`
 -   `gcloud`
 -   `git`
+-   `helm` for Helm-backed environments
+-   `argocd` for environments using the `argo-cd` deployment driver
 
 ### Configuration
 
@@ -40,10 +44,47 @@ env_yaml_dir_extra.demo = "/path/to/infra-demo-repo/k8s/staging"
 kubectl_context = "gke_context_staging"
 
 [[environments]]
-name = "production"
+name = "legacy-production"
 env_yaml_dir = "/path/to/infra-repo/k8s/prod"
 kubectl_context = "gke_context_prod"
 protected = true
+
+# A transitional environment can aggregate repositories with different drivers.
+[[environments]]
+name = "preprod"
+kubectl_context = "gke_context_preprod"
+
+[[environments.sources]]
+name = "legacy"
+type = "manifest"
+repo_root = "/path/to/legacy-infra/k8s/preprod"
+
+[[environments.sources]]
+name = "helm"
+type = "argo-cd"
+repo_root = "/path/to/helm-repo"
+helm_cluster = "ccs-preprod"
+```
+
+The legacy `env_yaml_dir`, `env_yaml_dir_extra`, `deployment_driver`, and `helm_cluster` fields
+remain supported and are converted to implicit sources. New configurations should prefer
+`environments.sources`: `type` accepts `manifest`, `helm`, or `argo-cd`; `repo_root` is the Git
+working copy, and Helm sources use `helm_cluster` to select `clusters/<helm_cluster>/apps` and its
+referenced values files.
+
+Before every deploy, inspection, or service listing, Davit runs `git pull --ff-only` for every
+distinct source repository. Untracked or modified files that do not overlap incoming changes are
+preserved and do not prevent the pull. A conflict, a divergent branch, or any other pull failure is
+printed and aborts the operation. Use `--no-fetch` only when deliberately working from local state.
+
+Davit normally identifies the primary image from the merged chart defaults and environment
+values. If a chart has multiple equally relevant application images, declare the tag explicitly
+on its ArgoCD Application:
+
+```yaml
+metadata:
+  annotations:
+    davit.io/image-tag-path: template-master.microserviceContainer.image.tag
 ```
 
 ### Installation

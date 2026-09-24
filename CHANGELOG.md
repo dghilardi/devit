@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added per-source Helm, ArgoCD, and manifest deployment drivers so one environment can aggregate repositories during migration, with Application discovery, values updates, chart validation/rendering, rendered cluster diffs, exact-revision sync, and rollout monitoring.
+
+### Changed
+- Helm-backed releases now commit and push their desired state before deployment, while existing manifest environments retain their previous workflow by default.
+- Source refresh now always attempts a fast-forward pull even with local changes, aborting visibly on conflicts or divergence instead of silently reading stale files.
+
 ## [0.4.1] 2026-09-19
 
 ### Added
