@@ -19,6 +19,18 @@ pub struct GitLogEntry {
 }
 
 impl Git {
+    pub fn repo_root(path: &Path) -> Option<std::path::PathBuf> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--show-toplevel"])
+            .output()
+            .ok()?;
+        output.status.success().then(|| {
+            std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        })
+    }
+
     pub fn head_sha(path: &Path) -> Result<String> {
         let output = Command::new("git")
             .arg("-C")
@@ -44,32 +56,11 @@ impl Git {
             .unwrap_or(false)
     }
 
-    /// Reports whether the working copy has uncommitted changes.
-    pub fn is_dirty(path: &Path) -> Result<bool> {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .arg("status")
-            .arg("--porcelain")
-            .output()
-            .context("Failed to execute git status")?;
-
-        if !output.status.success() {
-            return Err(anyhow::anyhow!(
-                "git status failed for {}: {}",
-                path.display(),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-
-        Ok(!output.stdout.is_empty())
-    }
-
     /// Performs a git pull.
     pub fn pull(path: &Path, dry_run: bool) -> Result<GitPullReport> {
         if dry_run {
             return Ok(GitPullReport {
-                stdout: format!("Dry-run: git -C {} pull\n", path.display()),
+                stdout: format!("Dry-run: git -C {} pull --ff-only\n", path.display()),
                 stderr: String::new(),
                 success: true,
             });
@@ -78,7 +69,7 @@ impl Git {
         let output = Command::new("git")
             .arg("-C")
             .arg(path)
-            .arg("pull")
+            .args(["pull", "--ff-only"])
             .output()
             .context("Failed to execute git pull")?;
 

@@ -8,7 +8,7 @@ use std::process::Command;
 use tempfile::NamedTempFile;
 use walkdir::WalkDir;
 
-use crate::config::{Environment, HelmServiceSource, ServiceSource};
+use crate::config::{Environment, HelmServiceSource, ServiceSource, YamlSource};
 
 const TAG_PATH_ANNOTATION: &str = "davit.io/image-tag-path";
 
@@ -29,12 +29,12 @@ struct ImageCandidate {
     score: usize,
 }
 
-pub fn discover_helm_services(env: &Environment) -> Result<Vec<ServiceSource>> {
-    let cluster = env
+pub fn discover_helm_services(source: &YamlSource) -> Result<Vec<ServiceSource>> {
+    let cluster = source
         .helm_cluster
         .as_deref()
         .context("helm_cluster is required for Helm environments")?;
-    let repo_root = &env.env_yaml_dir;
+    let repo_root = &source.root;
     let apps_dir = repo_root.join("clusters").join(cluster).join("apps");
     if !apps_dir.exists() {
         return Err(anyhow::anyhow!(
@@ -56,7 +56,7 @@ pub fn discover_helm_services(env: &Environment) -> Result<Vec<ServiceSource>> {
             )
         })
     {
-        match discover_application(repo_root, entry.path()) {
+        match discover_application(source, entry.path()) {
             Ok(Some(service)) => services.push(service),
             Ok(None) => {}
             Err(error) => eprintln!("Skipping {}: {error:#}", entry.path().display()),
@@ -68,9 +68,10 @@ pub fn discover_helm_services(env: &Environment) -> Result<Vec<ServiceSource>> {
 }
 
 fn discover_application(
-    repo_root: &Path,
+    source: &YamlSource,
     application_path: &Path,
 ) -> Result<Option<ServiceSource>> {
+    let repo_root = &source.root;
     let application: Value = serde_yaml::from_str(
         &fs::read_to_string(application_path)
             .with_context(|| format!("Failed to read {}", application_path.display()))?,
@@ -142,11 +143,12 @@ fn discover_application(
         kind: "HelmRelease".to_string(),
         image_path: format!("{}:{}", candidate.repository, candidate.tag),
         container_name: "default".to_string(),
-        source_name: "main".to_string(),
+        source_name: source.name.clone(),
         source_root: repo_root.to_path_buf(),
         yaml_path: values_path.clone(),
         namespace,
         selector: None,
+        deployment_driver: source.driver,
         helm: Some(HelmServiceSource {
             application_name: name,
             chart_path,
@@ -568,7 +570,6 @@ pub fn argocd_sync(service: &ServiceSource, revision: &str) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::DeploymentDriver;
-    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     #[test]
@@ -641,18 +642,14 @@ spec:
             root.join("clusters/test/values/auth.yaml"),
             "service:\n  image:\n    tag: 2.3.4\n",
         )?;
-        let environment = Environment {
-            name: "test".to_string(),
-            env_yaml_dir: root.to_path_buf(),
-            env_yaml_dir_extra: BTreeMap::new(),
-            kubectl_context: "test".to_string(),
-            gcp_project: None,
-            protected: None,
-            deployment_driver: DeploymentDriver::ArgoCd,
+        let source = YamlSource {
+            name: "helm".to_string(),
+            root: root.to_path_buf(),
+            driver: DeploymentDriver::ArgoCd,
             helm_cluster: Some("test".to_string()),
         };
 
-        let services = discover_helm_services(&environment)?;
+        let services = discover_helm_services(&source)?;
         assert_eq!(services.len(), 1);
         assert_eq!(services[0].name, "auth");
         assert_eq!(services[0].namespace.as_deref(), Some("services"));

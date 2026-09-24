@@ -189,7 +189,7 @@ async fn main() -> Result<()> {
             let auto_continue = auto_continue || auto_apply;
             let selected_env = resolve_environment(&config, env, policy)?;
 
-            pull_yaml_sources(&selected_env, dry_run, no_fetch, "deployment", policy)?;
+            pull_yaml_sources(&selected_env, dry_run, no_fetch, "deployment")?;
 
             let selected_service =
                 resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
@@ -434,7 +434,7 @@ async fn main() -> Result<()> {
         } => {
             let selected_env = resolve_environment(&config, env, policy)?;
 
-            pull_yaml_sources(&selected_env, false, no_fetch, "info", policy)?;
+            pull_yaml_sources(&selected_env, false, no_fetch, "info")?;
 
             let selected_service =
                 resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
@@ -459,7 +459,7 @@ async fn main() -> Result<()> {
             } => {
                 let selected_env = resolve_environment(&config, env, policy)?;
 
-                pull_yaml_sources(&selected_env, false, no_fetch, "listing", policy)?;
+                pull_yaml_sources(&selected_env, false, no_fetch, "listing")?;
 
                 let services = list_services_in_namespace(&selected_env, namespace.as_deref())?;
                 print_service_list(&services);
@@ -536,7 +536,7 @@ async fn deploy_helm_release(
             "Dry-run: would commit {} and deploy Application '{}' using {:?}.",
             helm_source.values_path.display(),
             helm_source.application_name,
-            env.deployment_driver
+            service.deployment_driver
         );
         return Ok(());
     }
@@ -572,7 +572,7 @@ async fn deploy_helm_release(
     let revision = Git::head_sha(&service.source_root)?;
     println!("Committed desired state at {}.", revision);
 
-    match env.deployment_driver {
+    match service.deployment_driver {
         DeploymentDriver::Helm => helm::helm_upgrade(env, service)?,
         DeploymentDriver::ArgoCd => helm::argocd_sync(service, &revision)?,
         DeploymentDriver::Manifest => unreachable!("Helm service with manifest driver"),
@@ -820,20 +820,35 @@ fn print_service_list(services: &[ServiceSource]) {
         .chain(std::iter::once("NAMESPACE".len()))
         .max()
         .unwrap_or_default();
+    let driver_width = rows
+        .iter()
+        .map(|(_, service)| deployment_driver_label(service.deployment_driver).len())
+        .chain(std::iter::once("DRIVER".len()))
+        .max()
+        .unwrap_or_default();
 
     println!(
-        "{:<name_width$}  {:<namespace_width$}  {:<12}  MANIFEST",
-        "SERVICE", "NAMESPACE", "KIND"
+        "{:<name_width$}  {:<namespace_width$}  {:<driver_width$}  {:<12}  SOURCE",
+        "SERVICE", "NAMESPACE", "DRIVER", "KIND"
     );
 
     for (name, service) in &rows {
         println!(
-            "{:<name_width$}  {:<namespace_width$}  {:<12}  {}",
+            "{:<name_width$}  {:<namespace_width$}  {:<driver_width$}  {:<12}  {}",
             name,
             namespace_label(service),
+            deployment_driver_label(service.deployment_driver),
             service.kind,
             get_service_source_display_path(service)
         );
+    }
+}
+
+fn deployment_driver_label(driver: DeploymentDriver) -> &'static str {
+    match driver {
+        DeploymentDriver::Manifest => "manifest",
+        DeploymentDriver::Helm => "helm",
+        DeploymentDriver::ArgoCd => "argo-cd",
     }
 }
 
@@ -872,13 +887,7 @@ fn get_service_source_display_path(service: &ServiceSource) -> String {
     format!("[{}]/{}", service.source_name, relative_path.display())
 }
 
-fn pull_yaml_sources(
-    env: &Environment,
-    dry_run: bool,
-    no_fetch: bool,
-    action: &str,
-    policy: PromptPolicy,
-) -> Result<()> {
+fn pull_yaml_sources(env: &Environment, dry_run: bool, no_fetch: bool, action: &str) -> Result<()> {
     if no_fetch {
         println!("Skipping the YAML source refresh (--no-fetch); reading manifests from disk.");
         return Ok(());
@@ -927,38 +936,13 @@ fn pull_yaml_sources(
         println!("  - [{}] {}: {}", source.name, source.root.display(), error);
     }
 
-    if !policy.confirm(
-        &format!(
-            "approval to continue with {} after a failed git pull",
-            action
-        ),
-        &format!("Do you want to continue with {} anyway?", action),
-        false,
-        "Fix the YAML sources listed above before retrying.",
-    )? {
-        return Err(anyhow::anyhow!(
-            "{} aborted by user after git pull failure.",
-            capitalize_action(action)
-        ));
-    }
-
-    Ok(())
+    Err(anyhow::anyhow!(
+        "{} aborted because at least one source could not be updated. Resolve the Git error above, or rerun explicitly with --no-fetch to use the local state.",
+        capitalize_action(action)
+    ))
 }
 
-/// Pulls one YAML source, unless that would merge into uncommitted local work.
-///
-/// Leaving the source stale is reported and treated as a success: it is not a
-/// failure the caller has to confirm, and refusing to touch edited manifests is
-/// the point.
 fn pull_source(source: &YamlSource, dry_run: bool) -> Result<GitPullReport> {
-    if !dry_run && Git::is_dirty(&source.root)? {
-        return Ok(GitPullReport {
-            stdout: "Skipped: the working copy has uncommitted changes, so it was not pulled.\nManifests read from it may be stale.\n".to_string(),
-            stderr: String::new(),
-            success: true,
-        });
-    }
-
     Git::pull(&source.root, dry_run)
 }
 
@@ -993,6 +977,8 @@ where
                     YamlSource {
                         name: "unknown".to_string(),
                         root: std::path::PathBuf::new(),
+                        driver: DeploymentDriver::Manifest,
+                        helm_cluster: None,
                     },
                     Err(anyhow::anyhow!("git pull worker thread panicked")),
                 )
@@ -1018,10 +1004,12 @@ fn unique_yaml_sources(env: &Environment) -> Vec<YamlSource> {
     let mut unique = Vec::new();
 
     for source in env.yaml_sources() {
-        let key = source
-            .root
-            .canonicalize()
-            .unwrap_or_else(|_| source.root.clone());
+        let key = Git::repo_root(&source.root).unwrap_or_else(|| {
+            source
+                .root
+                .canonicalize()
+                .unwrap_or_else(|_| source.root.clone())
+        });
         if seen.insert(key) {
             unique.push(source);
         }
@@ -1650,6 +1638,121 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    fn configure_test_git(path: &Path) {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["config", "user.email", "davit@example.invalid"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["config", "user.name", "Davit Test"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
+    fn create_pull_repositories() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let remote = directory.path().join("remote.git");
+        let seed = directory.path().join("seed");
+        let local = directory.path().join("local");
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "-q"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["clone", "-q"])
+                .arg(&remote)
+                .arg(&seed)
+                .status()
+                .unwrap()
+                .success()
+        );
+        configure_test_git(&seed);
+        std::fs::write(seed.join("manifest.yml"), "version: one\n").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args(["commit", "-qm", "initial"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&seed)
+                .args(["push", "-q", "origin", "HEAD"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args(["clone", "-q"])
+                .arg(&remote)
+                .arg(&local)
+                .status()
+                .unwrap()
+                .success()
+        );
+        (directory, seed, local)
+    }
+
+    fn commit_and_push_test_change(repository: &Path, file: &str, content: &str) {
+        std::fs::write(repository.join(file), content).unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args(["add", "."])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args(["commit", "-qm", "remote update"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args(["push", "-q"])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+
     #[test]
     fn test_service_display_name_unique() {
         let s = ServiceSource {
@@ -1662,6 +1765,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
+            deployment_driver: DeploymentDriver::Manifest,
             helm: None,
         };
         let all = vec![s.clone()];
@@ -1680,6 +1784,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
+            deployment_driver: DeploymentDriver::Manifest,
             helm: None,
         };
         let s2 = ServiceSource {
@@ -1692,6 +1797,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
             namespace: Some("ns2".to_string()),
             selector: None,
+            deployment_driver: DeploymentDriver::Manifest,
             helm: None,
         };
         let all = vec![s1.clone(), s2.clone()];
@@ -1711,6 +1817,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
+            deployment_driver: DeploymentDriver::Manifest,
             helm: None,
         };
         let s2 = ServiceSource {
@@ -1723,6 +1830,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
+            deployment_driver: DeploymentDriver::Manifest,
             helm: None,
         };
         let all = vec![s1.clone(), s2.clone()];
@@ -1901,6 +2009,7 @@ mod tests {
             protected: None,
             deployment_driver: config::DeploymentDriver::Manifest,
             helm_cluster: None,
+            sources: Vec::new(),
         }
     }
 
@@ -2119,37 +2228,52 @@ mod tests {
 
         // The directory is not a git repository, so a refresh fails and, with
         // nobody to confirm the failure, aborts. --no-fetch never gets there.
-        assert!(pull_yaml_sources(&env, false, false, "listing", blocked()).is_err());
-        assert!(pull_yaml_sources(&env, false, true, "listing", blocked()).is_ok());
+        assert!(pull_yaml_sources(&env, false, false, "listing").is_err());
+        assert!(pull_yaml_sources(&env, false, true, "listing").is_ok());
     }
 
     #[test]
-    fn test_pull_source_skips_a_dirty_working_copy() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        assert!(
-            Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["init", "-q"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        // Untracked content is enough to make the working copy dirty.
-        std::fs::write(root.join("manifest.yml"), "kind: Deployment\n").unwrap();
+    fn test_pull_source_updates_with_unrelated_untracked_content() {
+        let (_directory, seed, local) = create_pull_repositories();
+        commit_and_push_test_change(&seed, "remote.yml", "version: remote\n");
+        std::fs::write(local.join("manifest.yml"), "version: locally-modified\n").unwrap();
+        std::fs::write(local.join("local.yml"), "untracked: true\n").unwrap();
 
         let source = YamlSource {
             name: "main".to_string(),
-            root: root.to_path_buf(),
+            root: local.clone(),
+            driver: DeploymentDriver::Manifest,
+            helm_cluster: None,
         };
 
         let report = pull_source(&source, false).unwrap();
         assert!(report.success);
+        assert!(local.join("remote.yml").exists());
+        assert!(local.join("local.yml").exists());
+        assert_eq!(
+            std::fs::read_to_string(local.join("manifest.yml")).unwrap(),
+            "version: locally-modified\n"
+        );
+    }
+
+    #[test]
+    fn test_pull_source_reports_a_conflicting_local_change() {
+        let (_directory, seed, local) = create_pull_repositories();
+        commit_and_push_test_change(&seed, "manifest.yml", "version: remote\n");
+        std::fs::write(local.join("manifest.yml"), "version: local\n").unwrap();
+        let source = YamlSource {
+            name: "main".to_string(),
+            root: local,
+            driver: DeploymentDriver::Manifest,
+            helm_cluster: None,
+        };
+
+        let report = pull_source(&source, false).unwrap();
+        assert!(!report.success);
+        let output = format!("{}\n{}", report.stdout, report.stderr);
         assert!(
-            report.stdout.contains("uncommitted changes"),
-            "{}",
-            report.stdout
+            output.contains("local changes") || output.contains("would be overwritten"),
+            "{output}"
         );
     }
 
@@ -2159,6 +2283,8 @@ mod tests {
         let source = YamlSource {
             name: "main".to_string(),
             root: dir.path().to_path_buf(),
+            driver: DeploymentDriver::Manifest,
+            helm_cluster: None,
         };
 
         // Not a repository at all: reaching git status would fail.
@@ -2272,14 +2398,20 @@ mod tests {
             YamlSource {
                 name: "one".to_string(),
                 root: PathBuf::from("/tmp/one"),
+                driver: DeploymentDriver::Manifest,
+                helm_cluster: None,
             },
             YamlSource {
                 name: "two".to_string(),
                 root: PathBuf::from("/tmp/two"),
+                driver: DeploymentDriver::Manifest,
+                helm_cluster: None,
             },
             YamlSource {
                 name: "three".to_string(),
                 root: PathBuf::from("/tmp/three"),
+                driver: DeploymentDriver::Manifest,
+                helm_cluster: None,
             },
         ];
 
@@ -2301,6 +2433,8 @@ mod tests {
             .map(|idx| YamlSource {
                 name: format!("repo-{idx}"),
                 root: PathBuf::from(format!("/tmp/repo-{idx}")),
+                driver: DeploymentDriver::Manifest,
+                helm_cluster: None,
             })
             .collect();
 
