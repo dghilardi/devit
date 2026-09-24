@@ -37,19 +37,30 @@ Davit must respect the XDG Base Directory specification.
 **Example Schema:**
 
 ```toml
-[defaults]
-interactive = true
-
 [[environments]]
 name = "staging"
-repo_root = "/home/user/git/infra-repo/k8s/staging"
 kubectl_context = "gke_europe-west1_staging"
+
+[[environments.sources]]
+name = "legacy"
+type = "manifest"
+repo_root = "/home/user/git/infra-repo/k8s/staging"
+
+[[environments.sources]]
+name = "helm"
+type = "argo-cd"
+repo_root = "/home/user/git/helm"
+helm_cluster = "ccs-staging"
 
 [[environments]]
 name = "production"
-repo_root = "/home/user/git/infra-repo/k8s/prod"
 kubectl_context = "gke_europe-west1_prod"
 protected = true  # Forces an extra "type the environment name to confirm" step
+
+[[environments.sources]]
+name = "legacy"
+type = "manifest"
+repo_root = "/home/user/git/infra-repo/k8s/prod"
 
 ```
 
@@ -126,12 +137,17 @@ rendered manifest directly.
 ### 3.7 Helm and ArgoCD Sources
 
 * A Helm environment points at the repository root and a `clusters/<environment>` identifier.
+* An environment may aggregate multiple repositories and deployment drivers during migration;
+  discovery and deployment retain the selected service's source and driver.
 * Services are discovered from ArgoCD `Application` resources and their local chart and
   `$values/` references.
 * The primary repository is resolved from merged chart defaults and environment overrides; an
   Application may provide `davit.io/image-tag-path` when automatic resolution is ambiguous.
 * The preview must include both the values change and the resulting `helm template` change.
 * Davit must not use `kubectl apply` for Helm-backed services.
+* Every distinct source repository is refreshed with a fast-forward pull even when unrelated local
+  changes exist. Pull conflicts and branch divergence abort visibly; stale local state requires the
+  explicit `--no-fetch` option.
 
 ---
 

@@ -49,28 +49,33 @@ env_yaml_dir = "/path/to/infra-repo/k8s/prod"
 kubectl_context = "gke_context_prod"
 protected = true
 
-# Helm repository deployed directly with `helm upgrade --install`
+# A transitional environment can aggregate repositories with different drivers.
 [[environments]]
 name = "preprod"
-env_yaml_dir = "/path/to/helm-repo"
 kubectl_context = "gke_context_preprod"
-deployment_driver = "helm"
-helm_cluster = "ccs-preprod"
 
-# The same repository can be released through an ArgoCD Application.
-# Davit commits and pushes the values change before syncing the exact Git SHA.
-[[environments]]
-name = "production"
-env_yaml_dir = "/path/to/helm-repo"
-kubectl_context = "gke_context_prod"
-deployment_driver = "argo-cd"
-helm_cluster = "ccs-prod"
-protected = true
+[[environments.sources]]
+name = "legacy"
+type = "manifest"
+repo_root = "/path/to/legacy-infra/k8s/preprod"
+
+[[environments.sources]]
+name = "helm"
+type = "argo-cd"
+repo_root = "/path/to/helm-repo"
+helm_cluster = "ccs-preprod"
 ```
 
-`deployment_driver` defaults to `manifest`, preserving existing configurations. For Helm
-drivers, `env_yaml_dir` is the repository root and `helm_cluster` selects
-`clusters/<helm_cluster>/apps` and its referenced values files.
+The legacy `env_yaml_dir`, `env_yaml_dir_extra`, `deployment_driver`, and `helm_cluster` fields
+remain supported and are converted to implicit sources. New configurations should prefer
+`environments.sources`: `type` accepts `manifest`, `helm`, or `argo-cd`; `repo_root` is the Git
+working copy, and Helm sources use `helm_cluster` to select `clusters/<helm_cluster>/apps` and its
+referenced values files.
+
+Before every deploy, inspection, or service listing, Davit runs `git pull --ff-only` for every
+distinct source repository. Untracked or modified files that do not overlap incoming changes are
+preserved and do not prevent the pull. A conflict, a divergent branch, or any other pull failure is
+printed and aborts the operation. Use `--no-fetch` only when deliberately working from local state.
 
 Davit normally identifies the primary image from the merged chart defaults and environment
 values. If a chart has multiple equally relevant application images, declare the tag explicitly

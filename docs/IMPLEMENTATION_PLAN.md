@@ -112,8 +112,8 @@ Goal: Finalize the state and provide safety nets.
 Goal: Preserve Davit's release safety while moving the desired state to Helm values.
 
 ### 7.1 Application Discovery and Values Updates
-- **Task:** Discover local chart and `$values/` references from ArgoCD Applications, resolve the primary image from merged values, and update only its environment tag.
-- **Verification:** List services from a representative Helm repository and verify that comments and unrelated image tags remain unchanged.
+- **Task:** Aggregate manifest and Helm repositories under one environment, discover local chart and `$values/` references from ArgoCD Applications, resolve the primary image from merged values, and update only its environment tag.
+- **Verification:** List legacy and Helm services together, including their source driver, and verify that comments and unrelated image tags remain unchanged.
 
 ### 7.2 Rendered Validation and Deployment Drivers
 - **Task:** Run `helm lint` and `helm template`, show source/rendered/cluster differences, commit the desired state, then deploy through direct Helm or ArgoCD at the exact commit SHA.
