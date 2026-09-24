@@ -2,6 +2,7 @@ mod blueprint;
 mod config;
 mod dashboard;
 mod git;
+mod helm;
 mod info;
 mod prompt;
 mod registry;
@@ -10,7 +11,7 @@ use anyhow::{Context, Result};
 use blueprint::Blueprint;
 use chrono::Utc;
 use clap::{Parser, Subcommand};
-use config::{Config, Environment, ServiceSource, YamlSource};
+use config::{Config, DeploymentDriver, Environment, ServiceSource, YamlSource};
 use crossterm::{
     cursor::MoveToColumn,
     event::{self, Event, KeyCode, KeyEventKind},
@@ -193,14 +194,17 @@ async fn main() -> Result<()> {
             let selected_service =
                 resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
 
-            let remote_diff = check_remote_manifest_diff(
-                &selected_env.kubectl_context,
-                &selected_service.yaml_path,
-                dry_run,
-            )?;
-            if !confirm_remote_manifest_diff(&selected_service.yaml_path, remote_diff, policy)? {
-                println!("Deployment cancelled. No changes made.");
-                return Ok(());
+            if selected_service.helm.is_none() {
+                let remote_diff = check_remote_manifest_diff(
+                    &selected_env.kubectl_context,
+                    &selected_service.yaml_path,
+                    dry_run,
+                )?;
+                if !confirm_remote_manifest_diff(&selected_service.yaml_path, remote_diff, policy)?
+                {
+                    println!("Deployment cancelled. No changes made.");
+                    return Ok(());
+                }
             }
 
             let selected_tag =
@@ -221,6 +225,20 @@ async fn main() -> Result<()> {
                     dry_run,
                     policy,
                 )?;
+            }
+
+            if selected_service.helm.is_some() {
+                deploy_helm_release(
+                    &selected_env,
+                    &selected_service,
+                    &selected_tag,
+                    dry_run,
+                    auto_apply,
+                    auto_continue,
+                    policy,
+                )
+                .await?;
+                return Ok(());
             }
 
             // Phase 4 - YAML modification & Visual Diff
@@ -420,6 +438,7 @@ async fn main() -> Result<()> {
 
             let selected_service =
                 resolve_service_with_ns_filter(&selected_env, service, namespace, policy)?;
+            let selected_service = materialize_helm_service(selected_service)?;
             info::show_info(&selected_env, &selected_service).await?;
         }
         Commands::List { command } => match command {
@@ -458,6 +477,153 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn deploy_helm_release(
+    env: &Environment,
+    service: &ServiceSource,
+    selected_tag: &str,
+    dry_run: bool,
+    auto_apply: bool,
+    auto_continue: bool,
+    policy: PromptPolicy,
+) -> Result<()> {
+    let helm_source = service
+        .helm
+        .as_ref()
+        .context("Helm deployment metadata is missing")?;
+    let original_content = fs::read_to_string(&helm_source.values_path).with_context(|| {
+        format!(
+            "Failed to read Helm values at {}",
+            helm_source.values_path.display()
+        )
+    })?;
+    let updated_content =
+        helm::update_tag_at_path(&original_content, &helm_source.image_tag_path, selected_tag)?;
+
+    println!("Validating chart with helm lint and helm template...");
+    helm::lint(service, &updated_content)?;
+    let old_rendered = helm::render(service, &original_content)?;
+    let new_rendered = helm::render(service, &updated_content)?;
+    let filename = helm_source
+        .values_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("values.yaml");
+
+    println!("\nValues change:");
+    Blueprint::show_diff(&original_content, &updated_content, filename, true);
+    println!("\nRendered Kubernetes change:");
+    Blueprint::show_diff(&old_rendered, &new_rendered, "helm-template.yaml", true);
+    if dry_run {
+        println!("\nDry-run: would compare the rendered manifests with the cluster.");
+    } else {
+        match helm::cluster_diff(env, &new_rendered)? {
+            Some(diff) => println!("\nRendered state versus cluster:\n{diff}"),
+            None => println!("\nRendered state is already aligned with the cluster."),
+        }
+    }
+
+    if dry_run {
+        println!(
+            "Dry-run: would commit {} and deploy Application '{}' using {:?}.",
+            helm_source.values_path.display(),
+            helm_source.application_name,
+            env.deployment_driver
+        );
+        return Ok(());
+    }
+
+    if !auto_apply
+        && !policy.confirm(
+            "approval of the Helm release change",
+            "Commit this values change and deploy the release?",
+            true,
+            "Re-run with --auto-apply to commit and deploy without asking.",
+        )?
+    {
+        println!("Deployment cancelled. No changes made.");
+        return Ok(());
+    }
+
+    fs::write(&helm_source.values_path, &updated_content).with_context(|| {
+        format!(
+            "Failed to write Helm values to {}",
+            helm_source.values_path.display()
+        )
+    })?;
+    let commit_message = format!(
+        "deploy({}): update {} to {}",
+        env.name, service.name, selected_tag
+    );
+    Git::commit_and_push(
+        &service.source_root,
+        &commit_message,
+        &helm_source.values_path,
+        false,
+    )?;
+    let revision = Git::head_sha(&service.source_root)?;
+    println!("Committed desired state at {}.", revision);
+
+    match env.deployment_driver {
+        DeploymentDriver::Helm => helm::helm_upgrade(env, service)?,
+        DeploymentDriver::ArgoCd => helm::argocd_sync(service, &revision)?,
+        DeploymentDriver::Manifest => unreachable!("Helm service with manifest driver"),
+    }
+
+    let workload = helm::resolve_workload(&new_rendered, image_repository(&service.image_path))?;
+    println!(
+        "Release applied. Starting dashboard for {}...",
+        workload.name
+    );
+    let mut dashboard = Dashboard::new(
+        workload.name,
+        workload.kind,
+        env.name.clone(),
+        selected_tag.to_string(),
+        env.kubectl_context.clone(),
+        workload.namespace.or_else(|| service.namespace.clone()),
+        workload.selector,
+        workload.container_name,
+        auto_continue,
+    );
+    match dashboard.run().await? {
+        DashboardExit::RolloutCompleted => println!("Rollout completed."),
+        DashboardExit::UserQuit if auto_continue => {
+            return Err(anyhow::anyhow!(
+                "Dashboard closed before rollout completion in auto-continue mode"
+            ));
+        }
+        DashboardExit::UserQuit => println!("Dashboard closed before rollout completion check."),
+    }
+    Ok(())
+}
+
+fn materialize_helm_service(mut service: ServiceSource) -> Result<ServiceSource> {
+    let Some(helm_source) = service.helm.as_ref() else {
+        return Ok(service);
+    };
+    let values = fs::read_to_string(&helm_source.values_path)?;
+    let rendered = helm::render(&service, &values)?;
+    let workload = helm::resolve_workload(&rendered, image_repository(&service.image_path))?;
+    service.name = workload.name;
+    service.kind = workload.kind;
+    service.namespace = workload.namespace.or(service.namespace);
+    service.selector = workload.selector;
+    service.container_name = workload.container_name;
+    Ok(service)
+}
+
+fn image_repository(image: &str) -> &str {
+    if let Some((repository, _)) = image.split_once('@') {
+        return repository;
+    }
+    if let Some((repository, tag)) = image.rsplit_once(':')
+        && !tag.contains('/')
+    {
+        return repository;
+    }
+    image
 }
 
 fn resolve_environment(
@@ -1489,6 +1655,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
+            helm: None,
         };
         let all = vec![s.clone()];
         assert_eq!(get_service_display_name(&s, &all), "service1");
@@ -1506,6 +1673,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
+            helm: None,
         };
         let s2 = ServiceSource {
             name: "service1".to_string(),
@@ -1517,6 +1685,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
             namespace: Some("ns2".to_string()),
             selector: None,
+            helm: None,
         };
         let all = vec![s1.clone(), s2.clone()];
         assert_eq!(get_service_display_name(&s1, &all), "service1 (ns1)");
@@ -1535,6 +1704,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir1/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
+            helm: None,
         };
         let s2 = ServiceSource {
             name: "service1".to_string(),
@@ -1546,6 +1716,7 @@ mod tests {
             yaml_path: PathBuf::from("/root/dir2/deploy.yaml"),
             namespace: Some("ns1".to_string()),
             selector: None,
+            helm: None,
         };
         let all = vec![s1.clone(), s2.clone()];
         assert_eq!(
@@ -1721,6 +1892,8 @@ mod tests {
             kubectl_context: "ctx".to_string(),
             gcp_project: None,
             protected: None,
+            deployment_driver: config::DeploymentDriver::Manifest,
+            helm_cluster: None,
         }
     }
 

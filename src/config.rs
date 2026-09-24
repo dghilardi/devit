@@ -6,6 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+use crate::helm::discover_helm_services;
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub environments: Vec<Environment>,
@@ -20,6 +22,18 @@ pub struct Environment {
     pub kubectl_context: String,
     pub gcp_project: Option<String>,
     pub protected: Option<bool>,
+    #[serde(default)]
+    pub deployment_driver: DeploymentDriver,
+    pub helm_cluster: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeploymentDriver {
+    #[default]
+    Manifest,
+    Helm,
+    ArgoCd,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +53,15 @@ pub struct ServiceSource {
     pub yaml_path: std::path::PathBuf,
     pub namespace: Option<String>,
     pub selector: Option<String>,
+    pub helm: Option<HelmServiceSource>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HelmServiceSource {
+    pub application_name: String,
+    pub chart_path: PathBuf,
+    pub values_path: PathBuf,
+    pub image_tag_path: Vec<String>,
 }
 
 impl Environment {
@@ -61,6 +84,10 @@ impl Environment {
     }
 
     pub fn list_services(&self) -> Result<Vec<ServiceSource>> {
+        if self.deployment_driver != DeploymentDriver::Manifest {
+            return discover_helm_services(self);
+        }
+
         let mut services = HashSet::new();
 
         for source in self.yaml_sources() {
@@ -164,6 +191,7 @@ impl Environment {
                     yaml_path: yaml_path.to_path_buf(),
                     namespace,
                     selector,
+                    helm: None,
                 });
             }
         }
@@ -253,6 +281,16 @@ impl Config {
 
 impl Environment {
     fn validate(&self) -> Result<()> {
+        if self.deployment_driver != DeploymentDriver::Manifest
+            && self.helm_cluster.as_deref().unwrap_or_default().is_empty()
+        {
+            return Err(anyhow::anyhow!(
+                "Environment '{}' uses deployment_driver '{:?}' but does not define helm_cluster",
+                self.name,
+                self.deployment_driver
+            ));
+        }
+
         if self.env_yaml_dir_extra.contains_key("main") {
             return Err(anyhow::anyhow!(
                 "Environment '{}' uses reserved extra source name 'main'",
@@ -377,6 +415,8 @@ spec:
             kubectl_context: "test".to_string(),
             gcp_project: None,
             protected: None,
+            deployment_driver: DeploymentDriver::Manifest,
+            helm_cluster: None,
         };
 
         let services = env.list_services()?;
@@ -468,6 +508,8 @@ spec:
             kubectl_context: "test".to_string(),
             gcp_project: None,
             protected: None,
+            deployment_driver: DeploymentDriver::Manifest,
+            helm_cluster: None,
         };
 
         let services = env.list_services()?;

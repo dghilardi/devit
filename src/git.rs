@@ -19,6 +19,19 @@ pub struct GitLogEntry {
 }
 
 impl Git {
+    pub fn head_sha(path: &Path) -> Result<String> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .context("Failed to resolve Git HEAD")?;
+        if !output.status.success() {
+            return Err(anyhow::anyhow!("git rev-parse HEAD failed"));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
     /// Checks if the given directory is inside a git repository.
     pub fn is_repo(path: &Path) -> bool {
         Command::new("git")
