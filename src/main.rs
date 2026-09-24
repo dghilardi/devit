@@ -500,6 +500,13 @@ async fn deploy_helm_release(
     })?;
     let updated_content =
         helm::update_tag_at_path(&original_content, &helm_source.image_tag_path, selected_tag)?;
+    if updated_content == original_content {
+        println!(
+            "Helm values already select tag '{}'; no release is needed.",
+            selected_tag
+        );
+        return Ok(());
+    }
 
     println!("Validating chart with helm lint and helm template...");
     helm::lint(service, &updated_content)?;

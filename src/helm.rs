@@ -534,8 +534,12 @@ pub fn argocd_sync(service: &ServiceSource, revision: &str) -> Result<()> {
             &helm.application_name,
             "--revisions",
             revision,
+            "--source-positions",
+            "1",
             "--revisions",
             revision,
+            "--source-positions",
+            "2",
         ])
         .status()
         .context("Failed to execute argocd app sync; install/login to the ArgoCD CLI")?;
