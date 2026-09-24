@@ -14,7 +14,7 @@
 
 **Problem:** Our current deployment workflow relies on disparate manual steps: checking Google Artifact Registry (GAR), editing YAMLs by hand, switching `kubectl` contexts, and monitoring rollouts via raw terminal output. This "human glue" is prone to context errors (e.g., deploying to Prod instead of Staging) and lacks a standardized audit trail.
 
-**Solution:** Davit acts as a mechanical safety layer. It standardizes the path from Artifact Registry to running Pod. It validates inputs, visualizes changes via a TUI (Text User Interface), creates a unified diff of the infrastructure code, and provides a rich dashboard to monitor the specific moment of "handoff" between old and new pods.
+**Solution:** Davit acts as a mechanical safety layer. It standardizes the path from Artifact Registry to running Pod across legacy manifests and Helm/ArgoCD releases. It validates inputs, visualizes source and rendered changes via a TUI (Text User Interface), preserves Git as the desired-state authority, and provides a rich dashboard to monitor the specific moment of "handoff" between old and new pods.
 
 ---
 
@@ -116,6 +116,22 @@ Upon successful rollout (New Pod is Ready, Old Pod is Gone):
 2. `git commit -m "feat(deploy): update <service> to <tag> in <env>"`
 3. `git push`
 4. Display: *"Deployment Successful & Config Saved."*
+
+For Helm-backed environments the order is intentionally reversed: Davit updates the referenced
+environment values file, validates and renders the chart, commits and pushes the desired state,
+then deploys that exact revision with `helm upgrade --install` or an ArgoCD Application sync.
+Rollback is performed through Helm history or a Git revert plus ArgoCD sync, never by applying a
+rendered manifest directly.
+
+### 3.7 Helm and ArgoCD Sources
+
+* A Helm environment points at the repository root and a `clusters/<environment>` identifier.
+* Services are discovered from ArgoCD `Application` resources and their local chart and
+  `$values/` references.
+* The primary repository is resolved from merged chart defaults and environment overrides; an
+  Application may provide `davit.io/image-tag-path` when automatic resolution is ambiguous.
+* The preview must include both the values change and the resulting `helm template` change.
+* Davit must not use `kubectl apply` for Helm-backed services.
 
 ---
 

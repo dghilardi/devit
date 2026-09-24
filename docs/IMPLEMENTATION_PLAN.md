@@ -104,3 +104,21 @@ Goal: Finalize the state and provide safety nets.
 ### 6.3 Production Protection
 - **Task:** Implement the `protected = true` check (type environment name to confirm).
 - **Verification:** Try deploying to an environment marked `protected` and verify the mandatory text input confirmation.
+
+---
+
+## Phase 7: Helm and GitOps
+
+Goal: Preserve Davit's release safety while moving the desired state to Helm values.
+
+### 7.1 Application Discovery and Values Updates
+- **Task:** Discover local chart and `$values/` references from ArgoCD Applications, resolve the primary image from merged values, and update only its environment tag.
+- **Verification:** List services from a representative Helm repository and verify that comments and unrelated image tags remain unchanged.
+
+### 7.2 Rendered Validation and Deployment Drivers
+- **Task:** Run `helm lint` and `helm template`, show source/rendered/cluster differences, commit the desired state, then deploy through direct Helm or ArgoCD at the exact commit SHA.
+- **Verification:** Test both deployment drivers and confirm that Helm-backed services never execute `kubectl apply`.
+
+### 7.3 Helm-aware Inspection and Rollback
+- **Task:** Resolve the rendered workload for `davit info`; use Helm rollback or Git revert plus ArgoCD sync for failed releases.
+- **Verification:** Compare the rendered desired image with the live workload and exercise a failed rollout recovery.

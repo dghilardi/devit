@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added Helm and ArgoCD deployment drivers with Application discovery, environment values updates, chart validation/rendering, rendered cluster diffs, exact-revision sync, and rollout monitoring.
+
+### Changed
+- Helm-backed releases now commit and push their desired state before deployment, while existing manifest environments retain their previous workflow by default.
+
 ## [0.4.1] 2026-09-19
 
 ### Added
