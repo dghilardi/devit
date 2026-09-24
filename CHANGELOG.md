@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] 2026-09-24
+
 ### Added
 - Added per-source Helm, ArgoCD, and manifest deployment drivers so one environment can aggregate repositories during migration, with Application discovery, values updates, chart validation/rendering, rendered cluster diffs, exact-revision sync, and rollout monitoring.
 
