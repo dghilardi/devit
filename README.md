@@ -49,6 +49,10 @@ env_yaml_dir = "/path/to/infra-repo/k8s/prod"
 kubectl_context = "gke_context_prod"
 protected = true
 
+[environments.release_tag]
+enabled = true
+format = "prod_%Y%m%d"
+
 # A transitional environment can aggregate repositories with different drivers.
 [[environments]]
 name = "preprod"
@@ -76,6 +80,13 @@ Before every deploy, inspection, or service listing, Davit runs `git pull --ff-o
 distinct source repository. Untracked or modified files that do not overlap incoming changes are
 preserved and do not prevent the pull. A conflict, a divergent branch, or any other pull failure is
 printed and aborts the operation. Use `--no-fetch` only when deliberately working from local state.
+
+An environment can publish an annotated Git tag after a confirmed successful rollout by defining
+`environments.release_tag`. The format uses `strftime` placeholders and the machine's local time.
+If the formatted tag already exists locally or on `origin`, Davit appends the first available
+zero-padded increment (`_01`, `_02`, and so on). The tag is created in the selected service's source
+repository and pushed to `origin`; `--dry-run` only prints the tag and Git commands. No tag is
+created when Git commit/push is skipped or rollout completion is not confirmed.
 
 Davit normally identifies the primary image from the merged chart defaults and environment
 values. If a chart has multiple equally relevant application images, declare the tag explicitly

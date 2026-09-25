@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::format::{Item, StrftimeItems};
 use directories::ProjectDirs;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashSet};
@@ -28,6 +29,13 @@ pub struct Environment {
     pub helm_cluster: Option<String>,
     #[serde(default)]
     pub sources: Vec<YamlSource>,
+    pub release_tag: Option<ReleaseTagConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+pub struct ReleaseTagConfig {
+    pub enabled: bool,
+    pub format: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq, Hash)]
@@ -301,6 +309,22 @@ impl Config {
 
 impl Environment {
     fn validate(&self) -> Result<()> {
+        if let Some(release_tag) = &self.release_tag {
+            if release_tag.format.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Environment '{}' defines an empty release tag format",
+                    self.name
+                ));
+            }
+            if StrftimeItems::new(&release_tag.format).any(|item| matches!(item, Item::Error)) {
+                return Err(anyhow::anyhow!(
+                    "Environment '{}' defines an invalid release tag format '{}'",
+                    self.name,
+                    release_tag.format
+                ));
+            }
+        }
+
         if !self.env_yaml_dir.as_os_str().is_empty()
             && self.deployment_driver != DeploymentDriver::Manifest
             && self.helm_cluster.as_deref().unwrap_or_default().is_empty()
@@ -468,6 +492,7 @@ spec:
             deployment_driver: DeploymentDriver::Manifest,
             helm_cluster: None,
             sources: Vec::new(),
+            release_tag: None,
         };
 
         let services = env.list_services()?;
@@ -562,6 +587,7 @@ spec:
             deployment_driver: DeploymentDriver::Manifest,
             helm_cluster: None,
             sources: Vec::new(),
+            release_tag: None,
         };
 
         let services = env.list_services()?;
@@ -635,6 +661,52 @@ kubectl_context = "cluster-staging"
     }
 
     #[test]
+    fn test_environment_accepts_release_tag_configuration() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+[[environments]]
+name = "production"
+env_yaml_dir = "/repos/production"
+kubectl_context = "cluster-production"
+
+[environments.release_tag]
+enabled = true
+format = "prod_%Y%m%d"
+"#,
+        )?;
+        config.validate()?;
+
+        assert_eq!(
+            config.environments[0].release_tag,
+            Some(ReleaseTagConfig {
+                enabled: true,
+                format: "prod_%Y%m%d".to_string(),
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_environment_rejects_invalid_release_tag_format() -> Result<()> {
+        let config: Config = toml::from_str(
+            r#"
+[[environments]]
+name = "production"
+env_yaml_dir = "/repos/production"
+kubectl_context = "cluster-production"
+
+[environments.release_tag]
+enabled = true
+format = "prod_%Q"
+"#,
+        )?;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("invalid release tag format"), "{error}");
+        Ok(())
+    }
+
+    #[test]
     fn test_list_services_aggregates_manifest_and_helm_sources() -> Result<()> {
         let directory = tempdir()?;
         let legacy = directory.path().join("legacy");
@@ -683,6 +755,7 @@ kubectl_context = "cluster-staging"
                     helm_cluster: Some("test".to_string()),
                 },
             ],
+            release_tag: None,
         };
 
         let services = environment.list_services()?;

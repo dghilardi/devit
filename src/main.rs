@@ -340,11 +340,12 @@ async fn main() -> Result<()> {
                 }
             }
 
-            if dry_run {
+            let rollout_completed = if dry_run {
                 println!(
                     "Dry-run: would monitor the rollout of {} in the dashboard.",
                     selected_service.name
                 );
+                true
             } else {
                 println!("Deployment applied. Starting dashboard...");
 
@@ -374,12 +375,14 @@ async fn main() -> Result<()> {
                             ));
                         }
                         println!("Dashboard closed before rollout completion check.");
+                        false
                     }
                     Ok(DashboardExit::RolloutCompleted) => {
                         println!("Rollout completed. Continuing to the Git step...");
+                        true
                     }
                 }
-            }
+            };
 
             // 6.1 Git Automation
             println!("\n🚀 Deployment successful. Preparing to commit changes...");
@@ -404,6 +407,13 @@ async fn main() -> Result<()> {
                 if !dry_run {
                     println!("✅ Changes committed and pushed to Git.");
                 }
+                finish_release_tag(
+                    &selected_env,
+                    &selected_service,
+                    &selected_tag,
+                    rollout_completed,
+                    dry_run,
+                )?;
             } else {
                 if policy.confirm(
                     "approval to commit and push",
@@ -418,8 +428,15 @@ async fn main() -> Result<()> {
                         dry_run,
                     ) {
                         println!("⚠️  Failed to commit/push changes: {}", e);
-                    } else if !dry_run {
+                    } else {
                         println!("✅ Changes committed and pushed to Git.");
+                        finish_release_tag(
+                            &selected_env,
+                            &selected_service,
+                            &selected_tag,
+                            rollout_completed,
+                            false,
+                        )?;
                     }
                 } else {
                     println!("Committing skipped by user.");
@@ -538,6 +555,7 @@ async fn deploy_helm_release(
             helm_source.application_name,
             service.deployment_driver
         );
+        finish_release_tag(env, service, selected_tag, true, true)?;
         return Ok(());
     }
 
@@ -595,13 +613,43 @@ async fn deploy_helm_release(
         auto_continue,
     );
     match dashboard.run().await? {
-        DashboardExit::RolloutCompleted => println!("Rollout completed."),
+        DashboardExit::RolloutCompleted => {
+            println!("Rollout completed.");
+            finish_release_tag(env, service, selected_tag, true, false)?;
+        }
         DashboardExit::UserQuit if auto_continue => {
             return Err(anyhow::anyhow!(
                 "Dashboard closed before rollout completion in auto-continue mode"
             ));
         }
         DashboardExit::UserQuit => println!("Dashboard closed before rollout completion check."),
+    }
+    Ok(())
+}
+
+fn finish_release_tag(
+    env: &Environment,
+    service: &ServiceSource,
+    selected_tag: &str,
+    rollout_completed: bool,
+    dry_run: bool,
+) -> Result<()> {
+    let Some(config) = env.release_tag.as_ref().filter(|config| config.enabled) else {
+        return Ok(());
+    };
+
+    if !rollout_completed {
+        println!("⚠️  Release tag skipped because rollout completion was not confirmed.");
+        return Ok(());
+    }
+
+    let message = format!("release({}): {} {}", env.name, service.name, selected_tag);
+    let tag =
+        Git::create_and_push_release_tag(&service.source_root, &config.format, &message, dry_run)?;
+    if dry_run {
+        println!("Dry-run: would publish release tag '{}'.", tag);
+    } else {
+        println!("✅ Release tag '{}' created and pushed.", tag);
     }
     Ok(())
 }
@@ -2010,6 +2058,7 @@ mod tests {
             deployment_driver: config::DeploymentDriver::Manifest,
             helm_cluster: None,
             sources: Vec::new(),
+            release_tag: None,
         }
     }
 
