@@ -126,11 +126,15 @@ Upon successful rollout (New Pod is Ready, Old Pod is Gone):
 1. `git add <modified_file>`
 2. `git commit -m "feat(deploy): update <service> to <tag> in <env>"`
 3. `git push`
+4. When release tagging is enabled for the environment and rollout completion has been confirmed,
+   create and push an annotated tag for the release commit. The configured `strftime` format is the
+   base name; existing local or remote names receive an increment such as `_01`.
 4. Display: *"Deployment Successful & Config Saved."*
 
 For Helm-backed environments the order is intentionally reversed: Davit updates the referenced
 environment values file, validates and renders the chart, commits and pushes the desired state,
-then deploys that exact revision with `helm upgrade --install` or an ArgoCD Application sync.
+then deploys that exact revision with `helm upgrade --install` or an ArgoCD Application sync. Any
+configured release tag is still created only after rollout completion.
 Rollback is performed through Helm history or a Git revert plus ArgoCD sync, never by applying a
 rendered manifest directly.
 

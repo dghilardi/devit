@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added optional per-environment annotated release tags with configurable date formats and automatic increments for names already present locally or on the remote.
+
 ## [0.5.0] 2026-09-24
 
 ### Added
