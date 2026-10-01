@@ -116,7 +116,7 @@ Goal: Preserve Davit's release safety while moving the desired state to Helm val
 - **Verification:** List legacy and Helm services together, including their source driver, and verify that comments and unrelated image tags remain unchanged.
 
 ### 7.2 Rendered Validation and Deployment Drivers
-- **Task:** Run `helm lint` and `helm template`, show source/rendered/cluster differences, commit the desired state, then deploy through direct Helm or ArgoCD at the exact commit SHA.
+- **Task:** Run `helm lint` and `helm template`, show source/rendered/cluster differences, run direct Helm with live rollout logs and commit after success, or commit first and sync ArgoCD at the exact commit SHA.
 - **Verification:** Test both deployment drivers and confirm that Helm-backed services never execute `kubectl apply`.
 
 ### 7.3 Helm-aware Inspection and Rollback

@@ -132,7 +132,9 @@ Upon successful rollout (New Pod is Ready, Old Pod is Gone):
 4. Display: *"Deployment Successful & Config Saved."*
 
 For direct Helm releases, Davit validates and renders the updated environment values, runs
-`helm upgrade --install --atomic --wait`, and commits/pushes only after successful rollout.
+`helm upgrade --install --atomic --wait` alongside the live log dashboard, and commits/pushes
+only after both Helm and rollout monitoring confirm success. Closing logs does not cancel Helm;
+Davit waits for its result, including any automatic rollback, and leaves values uncommitted.
 Failed Helm upgrades restore the original local values without creating a Git commit. If Git
 commit/push fails after deployment, updated values are retained and the recovery need is reported.
 ArgoCD releases commit and push the desired state before syncing that exact Git revision.

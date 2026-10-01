@@ -496,13 +496,14 @@ fn find_matching_container(value: &Value, image_repository: &str) -> Option<Stri
         .find_map(|child| find_matching_container(child, image_repository))
 }
 
-pub fn helm_upgrade(env: &Environment, service: &ServiceSource) -> Result<()> {
+pub async fn helm_upgrade(env: &Environment, service: &ServiceSource) -> Result<()> {
     let helm = service
         .helm
         .as_ref()
         .context("Service is not Helm-backed")?;
     let namespace = service.namespace.as_deref().unwrap_or("default");
-    let status = Command::new("helm")
+    let mut command = tokio::process::Command::new("helm");
+    command
         .args(["upgrade", "--install", &helm.application_name])
         .arg(&helm.chart_path)
         .arg("-f")
@@ -515,11 +516,23 @@ pub fn helm_upgrade(env: &Environment, service: &ServiceSource) -> Result<()> {
             "--create-namespace",
             "--atomic",
             "--wait",
-        ])
-        .status()
+        ]);
+    execute_upgrade(&mut command).await
+}
+
+async fn execute_upgrade(command: &mut tokio::process::Command) -> Result<()> {
+    // Capture output so Helm cannot overwrite the live dashboard.
+    let output = command
+        .output()
+        .await
         .context("Failed to execute helm upgrade")?;
-    if !status.success() {
-        return Err(anyhow::anyhow!("helm upgrade failed"));
+    if !output.status.success() {
+        return Err(anyhow::anyhow!(
+            "helm upgrade failed ({}):\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        ));
     }
     Ok(())
 }
@@ -687,5 +700,35 @@ spec:
         assert_eq!(workload.selector.as_deref(), Some("app=auth-app"));
         assert_eq!(workload.container_name, "auth");
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod upgrade_process_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn captures_helm_failure_output_for_display_after_dashboard_closes() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args([
+            "-c",
+            "printf 'upgrade output'; printf 'rollback failed' >&2; exit 1",
+        ]);
+        let error = execute_upgrade(&mut command).await.unwrap_err().to_string();
+        assert!(error.contains("upgrade output"));
+        assert!(error.contains("rollback failed"));
+    }
+
+    #[tokio::test]
+    async fn waiting_for_upgrade_does_not_block_dashboard_updates() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "sleep 0.1"]);
+        let upgrade = execute_upgrade(&mut command);
+        tokio::pin!(upgrade);
+        tokio::select! {
+            result = &mut upgrade => panic!("upgrade finished before dashboard tick: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        upgrade.await.unwrap();
     }
 }

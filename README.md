@@ -15,6 +15,7 @@ In maritime terms, a **davit** is a crane-like device used to safely lower lifeb
     -   **Dashboard Mode:** Real-time rollout monitoring with split-screen logs (`ratatui`).
 -   **Visual Diffs:** Preview infrastructure YAML changes before applying them.
 -   **Helm & GitOps:** Discover ArgoCD Applications, update environment values, validate/render charts, and release through Helm or ArgoCD.
+-   **Live Helm Rollout:** Shows pod logs during the upgrade while preserving automatic rollback; closing the dashboard waits for Helm and leaves values uncommitted.
 -   **Automated Auditing:** Keeps the release state in Git; Direct Helm and manifest changes are committed after successful rollout; ArgoCD changes are committed before syncing the exact Git revision.
 -   **Deployment Info:** Inspect deployed services with `davit info` - refreshes the YAML sources (unless `--no-fetch` is passed), reads live workload state from cluster, and shows YAML vs cluster image drift together with workload status, current image version, last release commit, labels, pod details, resource usage, and recent events.
 -   **Scriptable:** `--non-interactive` never prompts and fails naming the decision it could not ask, so Davit can be driven from CI or an agent.

@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- Direct Helm releases now commit and push values only after successful rollout, restore local values on upgrade failure, and retain commit-before-sync for ArgoCD.
+- Direct Helm releases now commit and push values only after successful rollout, restore local values on upgrade failure, show live rollout logs while waiting with automatic rollback enabled, and retain commit-before-sync for ArgoCD.
 
 ## [0.6.0] 2026-09-25
 

@@ -24,7 +24,7 @@ use std::{
     io,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 const MAX_LOG_LINES: usize = 100;
 const VISIBLE_LOG_LINES: usize = 50;
@@ -64,6 +64,8 @@ pub struct Dashboard {
     completion_modal_visible: bool,
     completion_acknowledged: bool,
     auto_close_on_rollout_complete: bool,
+    deployment_rx: Option<oneshot::Receiver<std::result::Result<(), String>>>,
+    deployment_pending: bool,
 }
 
 struct LogLine {
@@ -129,16 +131,37 @@ impl Dashboard {
             completion_modal_visible: false,
             completion_acknowledged: false,
             auto_close_on_rollout_complete,
+            deployment_rx: None,
+            deployment_pending: false,
         }
     }
 
-    pub async fn run(&mut self) -> Result<DashboardExit> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
+    pub fn monitor_deployment(
+        &mut self,
+        receiver: oneshot::Receiver<std::result::Result<(), String>>,
+    ) {
+        self.deployment_rx = Some(receiver);
+        self.deployment_pending = true;
+    }
 
+    fn poll_deployment(&mut self) -> Result<()> {
+        if let Some(receiver) = self.deployment_rx.as_mut() {
+            match receiver.try_recv() {
+                Ok(result) => {
+                    self.deployment_rx = None;
+                    result.map_err(|error| anyhow::anyhow!(error))?;
+                    self.deployment_pending = false;
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    return Err(anyhow::anyhow!("Helm deployment monitor disconnected"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn run(&mut self) -> Result<DashboardExit> {
         let options = KubeConfigOptions {
             context: Some(self.kubectl_context.clone()),
             ..Default::default()
@@ -147,6 +170,12 @@ impl Dashboard {
             .await
             .context("Failed to load kubeconfig")?;
         let client = Client::try_from(config).context("Failed to create K8s client")?;
+
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend)?;
 
         let res = self.run_loop(&mut terminal, client).await;
 
@@ -222,6 +251,12 @@ impl Dashboard {
         let mut needs_redraw = true;
 
         loop {
+            tokio::task::yield_now().await;
+            self.poll_deployment()?;
+            self.update_rollout_modal_state();
+            if self.auto_close_on_rollout_complete && self.is_rollout_complete() {
+                return Ok(DashboardExit::RolloutCompleted);
+            }
             // 1. Update pod list
             while let Ok(pod_list) = self.pod_rx.try_recv() {
                 let mut current_pods = Vec::new();
@@ -469,9 +504,14 @@ impl Dashboard {
             ])
             .split(f.area());
 
+        let phase = if self.deployment_pending {
+            "Helm applying / waiting (rollback on failure; q closes logs)"
+        } else {
+            "Monitoring rollout (q closes logs)"
+        };
         let header = Paragraph::new(format!(
-            " Davit Rollout: {} | Env: {} | Tag: {} (Press 'q' to exit)",
-            self.service, self.env_name, self.tag
+            " Davit Rollout: {} | Env: {} | Tag: {} | {}",
+            self.service, self.env_name, self.tag, phase
         ))
         .block(Block::default().borders(Borders::ALL));
         f.render_widget(header, chunks[0]);
@@ -590,7 +630,8 @@ impl Dashboard {
             .filter(|pod| pod.is_new)
             .all(|pod| pod.status == "Running" && pod.ready_count == pod.total_containers);
 
-        has_new_pods
+        !self.deployment_pending
+            && has_new_pods
             && old_pods_gone
             && new_pods_ready
             && self.rollout_status.template_matches_tag
@@ -793,5 +834,85 @@ fn format_age(created: k8s_openapi::jiff::Timestamp) -> String {
         let days = secs / 86400;
         let hours = (secs % 86400) / 3600;
         format!("{}d{}h", days, hours)
+    }
+}
+
+#[cfg(test)]
+mod deployment_tests {
+    use super::*;
+
+    fn ready_dashboard() -> Dashboard {
+        let mut dashboard = Dashboard::new(
+            "service".into(),
+            "Deployment".into(),
+            "test".into(),
+            "v2".into(),
+            "context".into(),
+            None,
+            None,
+            "service".into(),
+            true,
+        );
+        dashboard.pods.push(PodInfo {
+            name: "new-pod".into(),
+            status: "Running".into(),
+            ready: "1/1".into(),
+            ready_count: 1,
+            total_containers: 1,
+            restarts: 0,
+            age: "1s".into(),
+            is_new: true,
+        });
+        dashboard.rollout_status = RolloutStatus {
+            template_matches_tag: true,
+            workload_complete: true,
+        };
+        dashboard
+    }
+
+    #[test]
+    fn ready_pods_wait_for_helm_hooks_to_finish() {
+        let mut dashboard = ready_dashboard();
+        let (sender, receiver) = oneshot::channel();
+        dashboard.monitor_deployment(receiver);
+        dashboard.poll_deployment().unwrap();
+        dashboard.update_rollout_modal_state();
+        assert!(!dashboard.is_rollout_complete());
+        assert!(!dashboard.completion_modal_visible);
+        sender.send(Ok(())).unwrap();
+        dashboard.poll_deployment().unwrap();
+        assert!(dashboard.is_rollout_complete());
+    }
+
+    #[test]
+    fn helm_failure_is_reported_even_when_pods_are_ready() {
+        let mut dashboard = ready_dashboard();
+        let (sender, receiver) = oneshot::channel();
+        dashboard.monitor_deployment(receiver);
+        sender
+            .send(Err("hook failed; rollback finished".into()))
+            .unwrap();
+        assert!(
+            dashboard
+                .poll_deployment()
+                .unwrap_err()
+                .to_string()
+                .contains("hook failed")
+        );
+        assert!(!dashboard.is_rollout_complete());
+    }
+
+    #[test]
+    fn disconnected_helm_task_is_an_error() {
+        let mut dashboard = ready_dashboard();
+        let (sender, receiver) = oneshot::channel();
+        dashboard.monitor_deployment(receiver);
+        drop(sender);
+        assert!(dashboard.poll_deployment().is_err());
+    }
+
+    #[test]
+    fn legacy_dashboard_does_not_require_a_helm_result() {
+        assert!(ready_dashboard().is_rollout_complete());
     }
 }
