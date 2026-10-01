@@ -131,10 +131,12 @@ Upon successful rollout (New Pod is Ready, Old Pod is Gone):
    base name; existing local or remote names receive an increment such as `_01`.
 4. Display: *"Deployment Successful & Config Saved."*
 
-For Helm-backed environments the order is intentionally reversed: Davit updates the referenced
-environment values file, validates and renders the chart, commits and pushes the desired state,
-then deploys that exact revision with `helm upgrade --install` or an ArgoCD Application sync. Any
-configured release tag is still created only after rollout completion.
+For direct Helm releases, Davit validates and renders the updated environment values, runs
+`helm upgrade --install --atomic --wait`, and commits/pushes only after successful rollout.
+Failed Helm upgrades restore the original local values without creating a Git commit. If Git
+commit/push fails after deployment, updated values are retained and the recovery need is reported.
+ArgoCD releases commit and push the desired state before syncing that exact Git revision.
+Any configured release tag is created only after rollout completion and successful commit/push.
 Rollback is performed through Helm history or a Git revert plus ArgoCD sync, never by applying a
 rendered manifest directly.
 

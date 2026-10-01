@@ -550,10 +550,15 @@ async fn deploy_helm_release(
 
     if dry_run {
         println!(
-            "Dry-run: would commit {} and deploy Application '{}' using {:?}.",
-            helm_source.values_path.display(),
+            "Dry-run: would deploy Application '{}' using {:?} and commit {} {} deployment.",
             helm_source.application_name,
-            service.deployment_driver
+            service.deployment_driver,
+            helm_source.values_path.display(),
+            if service.deployment_driver == DeploymentDriver::Helm {
+                "after successful"
+            } else {
+                "before"
+            }
         );
         finish_release_tag(env, service, selected_tag, true, true)?;
         return Ok(());
@@ -562,7 +567,11 @@ async fn deploy_helm_release(
     if !auto_apply
         && !policy.confirm(
             "approval of the Helm release change",
-            "Commit this values change and deploy the release?",
+            if service.deployment_driver == DeploymentDriver::Helm {
+                "Deploy the release and commit the values after successful rollout?"
+            } else {
+                "Commit this values change and sync the ArgoCD release?"
+            },
             true,
             "Re-run with --auto-apply to commit and deploy without asking.",
         )?
@@ -581,18 +590,30 @@ async fn deploy_helm_release(
         "deploy({}): update {} to {}",
         env.name, service.name, selected_tag
     );
-    Git::commit_and_push(
-        &service.source_root,
-        &commit_message,
-        &helm_source.values_path,
-        false,
-    )?;
-    let revision = Git::head_sha(&service.source_root)?;
-    println!("Committed desired state at {}.", revision);
-
     match service.deployment_driver {
-        DeploymentDriver::Helm => helm::helm_upgrade(env, service)?,
-        DeploymentDriver::ArgoCd => helm::argocd_sync(service, &revision)?,
+        DeploymentDriver::Helm => {
+            println!(
+                "Applying Helm release and waiting for readiness (automatic rollback on failure)..."
+            );
+            if let Err(error) = helm::helm_upgrade(env, service) {
+                fs::write(&helm_source.values_path, &original_content)
+                    .context("Helm failed; could not restore the original values file")?;
+                return Err(error.context(
+                    "Helm deployment failed; original values restored, no Git commit created",
+                ));
+            }
+        }
+        DeploymentDriver::ArgoCd => {
+            Git::commit_and_push(
+                &service.source_root,
+                &commit_message,
+                &helm_source.values_path,
+                false,
+            )?;
+            let revision = Git::head_sha(&service.source_root)?;
+            println!("Committed desired state at {}. Syncing ArgoCD...", revision);
+            helm::argocd_sync(service, &revision)?;
+        }
         DeploymentDriver::Manifest => unreachable!("Helm service with manifest driver"),
     }
 
@@ -615,6 +636,15 @@ async fn deploy_helm_release(
     match dashboard.run().await? {
         DashboardExit::RolloutCompleted => {
             println!("Rollout completed.");
+            if service.deployment_driver == DeploymentDriver::Helm {
+                Git::commit_and_push(
+                    &service.source_root,
+                    &commit_message,
+                    &helm_source.values_path,
+                    false,
+                ).context("Helm deployment succeeded, but Git commit/push failed; updated values retained for recovery")?;
+                println!("Release values committed and pushed.");
+            }
             finish_release_tag(env, service, selected_tag, true, false)?;
         }
         DashboardExit::UserQuit if auto_continue => {
@@ -622,7 +652,9 @@ async fn deploy_helm_release(
                 "Dashboard closed before rollout completion in auto-continue mode"
             ));
         }
-        DashboardExit::UserQuit => println!("Dashboard closed before rollout completion check."),
+        DashboardExit::UserQuit => println!(
+            "Dashboard closed before rollout completion check; direct Helm values remain uncommitted."
+        ),
     }
     Ok(())
 }
