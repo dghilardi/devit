@@ -226,6 +226,17 @@ fn collect_image_candidates(
     application_name: &str,
     candidates: &mut Vec<ImageCandidate>,
 ) {
+    if path.last().is_some_and(|part| part == "image")
+        && let Some((repository, tag)) = value.as_str().and_then(split_tagged_image)
+    {
+        candidates.push(ImageCandidate {
+            repository: repository.to_string(),
+            tag: tag.to_string(),
+            tag_path: path.clone(),
+            score: image_candidate_score(path, repository, application_name),
+        });
+    }
+
     let Some(mapping) = value.as_mapping() else {
         return;
     };
@@ -239,28 +250,13 @@ fn collect_image_candidates(
     if let (Some(repository), Some(tag)) = (repository, tag)
         && (repository.contains("gcr.io") || repository.contains("pkg.dev"))
     {
-        let normalized_app = application_name.replace(['-', '_'], "");
-        let normalized_repo = repository.replace(['-', '_'], "");
-        let mut score = if path
-            .iter()
-            .any(|part| part.eq_ignore_ascii_case("microserviceContainer"))
-        {
-            100
-        } else if path.last().is_some_and(|part| part == "image") {
-            50
-        } else {
-            0
-        };
-        if normalized_repo.contains(&normalized_app) {
-            score += 20;
-        }
         let mut tag_path = path.clone();
         tag_path.push("tag".to_string());
         candidates.push(ImageCandidate {
             repository: repository.to_string(),
             tag,
             tag_path,
-            score,
+            score: image_candidate_score(path, repository, application_name),
         });
     }
 
@@ -274,6 +270,36 @@ fn collect_image_candidates(
     }
 }
 
+fn image_candidate_score(path: &[String], repository: &str, application_name: &str) -> usize {
+    let mut score = if path
+        .iter()
+        .any(|part| part.eq_ignore_ascii_case("microserviceContainer") || part == "app")
+    {
+        100
+    } else if path.last().is_some_and(|part| part == "image") {
+        50
+    } else {
+        0
+    };
+    let normalized_app = application_name.replace(['-', '_'], "");
+    let normalized_repo = repository.replace(['-', '_'], "");
+    if normalized_repo.contains(&normalized_app) {
+        score += 20;
+    }
+    score
+}
+
+fn split_tagged_image(image: &str) -> Option<(&str, &str)> {
+    if image.contains('@') || !(image.contains("gcr.io") || image.contains("pkg.dev")) {
+        return None;
+    }
+    let (repository, tag) = image.rsplit_once(':')?;
+    if repository.is_empty() || tag.is_empty() || tag.contains('/') {
+        return None;
+    }
+    Some((repository, tag))
+}
+
 fn scalar_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
@@ -285,8 +311,17 @@ fn scalar_to_string(value: &Value) -> Option<String> {
 pub fn update_tag_at_path(content: &str, path: &[String], new_tag: &str) -> Result<String> {
     let parsed: Value =
         serde_yaml::from_str(content).context("Failed to parse Helm values YAML")?;
-    value_at(&parsed, path)
+    let current = value_at(&parsed, path)
         .with_context(|| format!("Image tag path '{}' does not exist", path.join(".")))?;
+    let replacement = if path.last().is_some_and(|part| part == "image") {
+        let (repository, _) = current
+            .as_str()
+            .and_then(split_tagged_image)
+            .context("Image path does not contain a tagged gcr.io or pkg.dev image")?;
+        format!("{repository}:{new_tag}")
+    } else {
+        new_tag.to_string()
+    };
 
     let mut stack: Vec<(usize, String)> = Vec::new();
     let mut result = String::with_capacity(content.len() + new_tag.len());
@@ -324,10 +359,10 @@ pub fn update_tag_at_path(content: &str, path: &[String], new_tag: &str) -> Resu
                 result.push(' ');
                 if let Some(quote) = quote {
                     result.push(quote);
-                    result.push_str(new_tag);
+                    result.push_str(&replacement);
                     result.push(quote);
                 } else {
-                    result.push_str(new_tag);
+                    result.push_str(&replacement);
                 }
                 result.push_str(suffix);
                 if line.ends_with('\n') {
@@ -623,6 +658,57 @@ template-master:
     }
 
     #[test]
+    fn inline_image_prefers_app_over_sidecar_and_supports_explicit_path() {
+        let values: Value = serde_yaml::from_str(
+            "haproxy:\n  image: gcr.io/project/haproxy:3.2\napp:\n  image: gcr.io/project/webapp-koncierge:1.0.5\n",
+        )
+        .unwrap();
+        let candidate = select_image_candidate(&values, None, "webapp-concierge").unwrap();
+        assert_eq!(candidate.repository, "gcr.io/project/webapp-koncierge");
+        assert_eq!(candidate.tag, "1.0.5");
+        assert_eq!(candidate.tag_path.join("."), "app.image");
+        let explicit = ["haproxy", "image"].map(ToString::to_string);
+        let candidate =
+            select_image_candidate(&values, Some(&explicit), "webapp-concierge").unwrap();
+        assert_eq!(candidate.repository, "gcr.io/project/haproxy");
+    }
+
+    #[test]
+    fn updates_inline_image_without_changing_repository_sidecar_or_formatting() {
+        let path = ["app", "image"].map(ToString::to_string);
+        for quote in ["", "'", "\""] {
+            let original = format!(
+                "# values\napp:\n  image: {quote}europe-west1-docker.pkg.dev/project/apps/concierge:1.0{quote} # release\nhaproxy:\n  image: gcr.io/project/haproxy:3.2"
+            );
+            let updated = update_tag_at_path(&original, &path, "2.0").unwrap();
+            assert_eq!(updated, original.replace("concierge:1.0", "concierge:2.0"));
+        }
+    }
+
+    #[test]
+    fn inline_images_without_mutable_tags_are_not_discovered() {
+        for image in [
+            "gcr.io/project/app",
+            "gcr.io:443/project/app",
+            "gcr.io/project/app:",
+            "gcr.io/project/app@sha256:abc",
+            "gcr.io/project/app:1.0@sha256:abc",
+            "docker.io/project/app:1.0",
+        ] {
+            let values: Value =
+                serde_yaml::from_str(&format!("app:\n  image: {image:?}\n")).unwrap();
+            assert!(
+                select_image_candidate(&values, None, "app").is_err(),
+                "{image}"
+            );
+        }
+        assert_eq!(
+            split_tagged_image("gcr.io:443/project/app:1.0"),
+            Some(("gcr.io:443/project/app", "1.0"))
+        );
+    }
+
+    #[test]
     fn discovers_application_chart_values_and_environment_tag() -> Result<()> {
         let directory = tempdir()?;
         let root = directory.path();
@@ -670,6 +756,26 @@ spec:
         assert_eq!(
             services[0].helm.as_ref().unwrap().image_tag_path.join("."),
             "service.image.tag"
+        );
+
+        // A migrated webapp uses a full image scalar and has a GCR sidecar.
+        fs::write(
+            root.join("charts/usvc/auth/values.yaml"),
+            "app:\n  image: \"\"\nhaproxy:\n  image: gcr.io/project/haproxy:3.2\n",
+        )?;
+        let values = "app:\n  image: gcr.io/project/webapp-koncierge:1.0.5 # release\n";
+        fs::write(root.join("clusters/test/values/auth.yaml"), values)?;
+        let services = discover_helm_services(&source)?;
+        assert_eq!(services.len(), 1);
+        assert_eq!(
+            services[0].image_path,
+            "gcr.io/project/webapp-koncierge:1.0.5"
+        );
+        let path = &services[0].helm.as_ref().unwrap().image_tag_path;
+        assert_eq!(path.join("."), "app.image");
+        assert_eq!(
+            update_tag_at_path(values, path, "2.0.0")?,
+            values.replace(":1.0.5", ":2.0.0")
         );
         Ok(())
     }
