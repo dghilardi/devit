@@ -90,14 +90,17 @@ repository and pushed to `origin`; `--dry-run` only prints the tag and Git comma
 created when Git commit/push is skipped or rollout completion is not confirmed.
 
 Davit normally identifies the primary image from the merged chart defaults and environment
-values. If a chart has multiple equally relevant application images, declare the tag explicitly
-on its ArgoCD Application:
+values, supporting both separate `image.repository`/`image.tag` fields and full `image: repository:tag`
+strings. It prefers `microserviceContainer` or `app` images over sidecars. If a chart has multiple
+equally relevant application images, declare the tag explicitly on its ArgoCD Application:
 
 ```yaml
 metadata:
   annotations:
     davit.io/image-tag-path: template-master.microserviceContainer.image.tag
 ```
+
+For a full image string, point the annotation to the image itself (for example, `app.image`).
 
 ### Installation
 
