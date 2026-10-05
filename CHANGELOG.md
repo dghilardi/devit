@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] 2026-10-05
+
 ### Fixed
 - Helm discovery and tag updates now support full `repository:tag` image values, preferring the application image over sidecars.
 
