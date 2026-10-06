@@ -1,4 +1,5 @@
 mod apply;
+mod apply_helm;
 mod blueprint;
 mod config;
 mod dashboard;

@@ -25,6 +25,99 @@ fn git(root: &Path, args: &[&str]) -> String {
 }
 
 impl Fixture {
+    fn helm_source(&self) {
+        let repo = self.dir.path().join("repo");
+        for dir in ["charts/app/templates", "clusters/test/apps", "env"] {
+            fs::create_dir_all(repo.join(dir)).unwrap();
+        }
+        fs::write(
+            repo.join("charts/app/Chart.yaml"),
+            "apiVersion: v2\nname: app\nversion: 0.1.0\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("charts/app/values.yaml"),
+            "setting: old\nimage: nginx:old\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("charts/app/templates/config.yaml"),
+            "marker: initial\n{{ .Values.setting }}\n",
+        )
+        .unwrap();
+        fs::write(repo.join("env/api.yaml"), "setting: old\n").unwrap();
+        fs::write(repo.join("env/override.yaml"), "image: nginx:old\n").unwrap();
+        fs::write(repo.join("clusters/test/apps/api.yaml"), "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: api\nspec:\n  destination:\n    namespace: test\n  sources:\n  - path: charts/app\n    helm:\n      releaseName: api-release\n      valueFiles:\n      - $values/env/api.yaml\n      - $values/env/override.yaml\n  - ref: values\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "initial chart"]);
+        fs::write(self.dir.path().join("config.toml"), format!("[[environments]]\nname = 'test'\nkubectl_context = 'fake-context'\n[[environments.sources]]\nname = 'helm'\ntype = 'helm'\nrepo_root = '{}'\nhelm_cluster = 'test'\n", repo.display())).unwrap();
+        let mock = self.dir.path().join("bin/helm");
+        fs::write(&mock, r#"#!/bin/sh
+printf 'helm:%s\n' "$*" >> "$COMMAND_LOG"
+operation=$1
+shift
+case "$operation" in
+  template) name=$1; shift; chart=$1; shift ;;
+  upgrade) shift; name=$1; shift; chart=$1; shift ;;
+  lint) exit 0 ;;
+esac
+setting=$(sed -n 's/^setting: //p' "$chart/values.yaml")
+image=$(sed -n 's/^image: //p' "$chart/values.yaml")
+marker=$(sed -n 's/^marker: //p' "$chart/templates/config.yaml")
+secret=''
+namespace=default
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -f) shift; value=$(sed -n 's/^setting: //p' "$1"); [ -z "$value" ] || setting=$value; value=$(sed -n 's/^image: //p' "$1"); [ -z "$value" ] || image=$value; value=$(sed -n 's/^secret: //p' "$1"); [ -z "$value" ] || secret=$value ;;
+    --namespace) shift; namespace=$1 ;;
+  esac
+  shift
+done
+printf 'capture:%s:%s:%s:%s\n' "$operation" "$name" "$setting" "$image" >> "$COMMAND_LOG"
+if [ "$operation" = upgrade ]; then
+  if [ "$UPGRADE_FAIL" = "$name" ]; then echo private-upgrade-output >&2; exit 1; fi
+  exit 0
+fi
+cat <<YAML
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: $name-settings
+  namespace: $namespace
+data:
+  setting: $setting
+  marker: $marker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $name
+  namespace: $namespace
+spec:
+  template:
+    spec:
+      containers:
+      - name: api
+        image: $image
+        envFrom:
+        - configMapRef:
+            name: $name-settings
+YAML
+if [ -n "$secret" ]; then
+cat <<YAML
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: $name-password
+stringData:
+  password: $secret
+YAML
+fi
+"#).unwrap();
+        fs::set_permissions(mock, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     fn new() -> Self {
         let dir = tempfile::tempdir().unwrap();
         for name in ["repo", "remote", "bin"] {
@@ -381,4 +474,349 @@ fn avoids_duplicate_restart_only_when_template_changed_after_configuration() {
             expected_restart
         );
     }
+}
+
+#[test]
+fn helm_applies_selected_values_once_and_preserves_unselected_changes() {
+    let f = Fixture::new();
+    f.helm_source();
+    let repo = f.dir.path().join("repo");
+    fs::write(repo.join("env/api.yaml"), "setting: selected\n").unwrap();
+    fs::write(repo.join("env/override.yaml"), "image: nginx:unselected\n").unwrap();
+    fs::write(repo.join("unrelated.txt"), "staged").unwrap();
+    git(&repo, &["add", "unrelated.txt"]);
+    Fixture::success(
+        f.command()
+            .args([
+                "--file",
+                "env/api.yaml",
+                "--message",
+                "fix: helm config",
+                "--yes",
+                "--restart",
+                "skip",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let log = f.log();
+    assert!(log.contains("capture:upgrade:api-release:selected:nginx:old"));
+    assert!(!log.contains("nginx:unselected"));
+    assert!(log.contains("--kube-context fake-context --namespace test --atomic --wait"));
+    assert!(
+        log.lines()
+            .filter(|l| l.contains(" apply "))
+            .all(|l| l.contains("--dry-run=server"))
+    );
+    let committed = git(&repo, &["show", "--pretty=", "--name-only", "HEAD"]);
+    assert_eq!(committed.trim(), "env/api.yaml");
+    assert_eq!(
+        git(&repo, &["diff", "--cached", "--name-only"]).trim(),
+        "unrelated.txt"
+    );
+    assert!(git(&repo, &["diff", "--name-only"]).contains("env/override.yaml"));
+}
+
+#[test]
+fn helm_groups_selected_values_and_chart_yaml_into_one_upgrade() {
+    let f = Fixture::new();
+    f.helm_source();
+    let repo = f.dir.path().join("repo");
+    fs::write(repo.join("env/api.yaml"), "setting: selected\n").unwrap();
+    fs::write(repo.join("env/override.yaml"), "image: nginx:selected\n").unwrap();
+    fs::write(
+        repo.join("charts/app/templates/config.yaml"),
+        "marker: changed\n{{ .Values.setting }}\n",
+    )
+    .unwrap();
+    Fixture::success(
+        f.command()
+            .args([
+                "--file",
+                "env/api.yaml",
+                "--file",
+                "env/override.yaml",
+                "--file",
+                "charts/app/templates/config.yaml",
+                "--message",
+                "fix: chart",
+                "--yes",
+                "--restart",
+                "skip",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        f.log()
+            .lines()
+            .filter(|l| l.starts_with("helm:upgrade"))
+            .count(),
+        1
+    );
+    assert!(
+        f.log()
+            .contains("capture:upgrade:api-release:selected:nginx:selected")
+    );
+    assert!(
+        git(&repo, &["show", "--pretty=", "--name-only", "HEAD"])
+            .contains("charts/app/templates/config.yaml")
+    );
+}
+
+#[test]
+fn shared_chart_changes_upgrade_all_affected_releases() {
+    let f = Fixture::new();
+    f.helm_source();
+    let repo = f.dir.path().join("repo");
+    let application = fs::read_to_string(repo.join("clusters/test/apps/api.yaml"))
+        .unwrap()
+        .replace("name: api", "name: worker")
+        .replace("releaseName: api-release", "releaseName: worker-release");
+    fs::write(repo.join("clusters/test/apps/worker.yaml"), application).unwrap();
+    git(&repo, &["add", "clusters/test/apps/worker.yaml"]);
+    git(&repo, &["commit", "-m", "second release"]);
+    fs::write(
+        repo.join("charts/app/templates/config.yaml"),
+        "marker: shared-change\n{{ .Values.setting }}\n",
+    )
+    .unwrap();
+    Fixture::success(
+        f.command()
+            .args([
+                "--file",
+                "charts/app/templates/config.yaml",
+                "--message",
+                "fix: shared chart",
+                "--yes",
+                "--restart",
+                "skip",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        f.log()
+            .lines()
+            .filter(|l| l.starts_with("helm:upgrade"))
+            .count(),
+        2
+    );
+    assert!(f.log().contains("capture:upgrade:worker-release"));
+}
+
+#[test]
+fn failed_helm_upgrade_keeps_edits_uncommitted_and_hides_error_payloads() {
+    let f = Fixture::new();
+    f.helm_source();
+    let repo = f.dir.path().join("repo");
+    fs::write(
+        repo.join("env/api.yaml"),
+        "setting: selected\nsecret: super-private-value\n",
+    )
+    .unwrap();
+    let output = f
+        .command()
+        .env("UPGRADE_FAIL", "api-release")
+        .args([
+            "--file",
+            "env/api.yaml",
+            "--message",
+            "fix: helm",
+            "--yes",
+            "--restart",
+            "skip",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!printed.contains("super-private-value"));
+    assert!(!printed.contains("private-upgrade-output"));
+    assert!(printed.contains("automatic rollback was requested"));
+    assert_eq!(
+        git(&repo, &["log", "-1", "--format=%s"]).trim(),
+        "initial chart"
+    );
+    assert!(
+        fs::read_to_string(repo.join("env/api.yaml"))
+            .unwrap()
+            .contains("super-private-value")
+    );
+}
+
+#[test]
+fn helm_dry_run_renders_locally_without_cluster_or_upgrade() {
+    let f = Fixture::new();
+    f.helm_source();
+    fs::write(
+        f.dir.path().join("repo/env/api.yaml"),
+        "setting: selected\n",
+    )
+    .unwrap();
+    let output = f
+        .command()
+        .args(["--file", "env/api.yaml", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Dry-run: helm upgrade"));
+    Fixture::success(output);
+    assert!(
+        f.log()
+            .lines()
+            .all(|l| l.starts_with("helm:") || l.starts_with("capture:"))
+    );
+    assert!(!f.log().contains("helm:upgrade"));
+}
+
+#[test]
+fn rejects_unselected_application_routing_edits_before_any_cluster_access() {
+    let f = Fixture::new();
+    f.helm_source();
+    let repo = f.dir.path().join("repo");
+    fs::write(repo.join("env/api.yaml"), "setting: selected\n").unwrap();
+    let application = repo.join("clusters/test/apps/api.yaml");
+    fs::write(
+        &application,
+        fs::read_to_string(&application)
+            .unwrap()
+            .replace("namespace: test", "namespace: other"),
+    )
+    .unwrap();
+    let output = f
+        .command()
+        .args([
+            "--file",
+            "env/api.yaml",
+            "--message",
+            "fix: values",
+            "--yes",
+            "--restart",
+            "skip",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("commit routing changes separately"));
+    assert!(f.log().is_empty());
+}
+
+#[test]
+fn mixes_explicit_manifest_subsources_and_helm_in_selected_order() {
+    let f = Fixture::new();
+    f.helm_source();
+    let repo = f.dir.path().join("repo");
+    fs::create_dir(repo.join("k8s")).unwrap();
+    f.manifest("k8s/manual.yaml", "manual");
+    fs::write(repo.join("env/api.yaml"), "setting: selected\n").unwrap();
+    let config = f.dir.path().join("config.toml");
+    let mut content = fs::read_to_string(&config).unwrap();
+    content.push_str(&format!(
+        "[[environments.sources]]\nname = 'manifest'\ntype = 'manifest'\nrepo_root = '{}'\n",
+        repo.join("k8s").display()
+    ));
+    fs::write(config, content).unwrap();
+    Fixture::success(
+        f.command()
+            .args([
+                "--file",
+                "k8s/manual.yaml",
+                "--file",
+                "env/api.yaml",
+                "--message",
+                "fix: mixed config",
+                "--yes",
+                "--restart",
+                "skip",
+            ])
+            .output()
+            .unwrap(),
+    );
+    let log = f.log();
+    let applied = log
+        .lines()
+        .filter(|l| l.contains(" apply ") && !l.contains("--dry-run=server"))
+        .count();
+    assert_eq!(applied, 1);
+    assert!(log.rfind("resource:manual").unwrap() < log.find("helm:upgrade").unwrap());
+    let committed = git(&repo, &["show", "--pretty=", "--name-only", "HEAD"]);
+    assert!(committed.contains("env/api.yaml") && committed.contains("k8s/manual.yaml"));
+}
+
+#[test]
+fn helm_configuration_restart_uses_rendered_references() {
+    let f = Fixture::new();
+    f.helm_source();
+    fs::write(
+        f.dir.path().join("repo/env/api.yaml"),
+        "setting: selected\n",
+    )
+    .unwrap();
+    let workloads = r#"{"items":[{"kind":"Deployment","metadata":{"name":"api-release","namespace":"test"},"spec":{"template":{"spec":{"containers":[{"envFrom":[{"configMapRef":{"name":"api-release-settings"}}]}]}}}}]}"#;
+    Fixture::success(
+        f.command()
+            .env("WORKLOADS", workloads)
+            .args([
+                "--file",
+                "env/api.yaml",
+                "--message",
+                "fix: settings",
+                "--yes",
+                "--restart",
+                "all",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert!(f.log().contains("rollout restart deployment/api-release"));
+}
+
+#[test]
+fn multiple_helm_releases_with_changed_templates_do_not_restart_twice() {
+    let f = Fixture::new();
+    f.helm_source();
+    let repo = f.dir.path().join("repo");
+    let application = fs::read_to_string(repo.join("clusters/test/apps/api.yaml"))
+        .unwrap()
+        .replace("name: api", "name: worker")
+        .replace("releaseName: api-release", "releaseName: worker-release");
+    fs::write(repo.join("clusters/test/apps/worker.yaml"), application).unwrap();
+    git(&repo, &["add", "clusters/test/apps/worker.yaml"]);
+    git(&repo, &["commit", "-m", "second release"]);
+    fs::write(repo.join("env/api.yaml"), "setting: selected\n").unwrap();
+    fs::write(repo.join("env/override.yaml"), "image: nginx:new\n").unwrap();
+    let items: Vec<_> = ["api-release", "worker-release"].into_iter().map(|name| serde_json::json!({
+        "kind": "Deployment", "metadata": {"name": name, "namespace": "test"},
+        "spec": {"template": {"spec": {"containers": [{"envFrom": [{"configMapRef": {"name": format!("{name}-settings")}}]}]}}}
+    })).collect();
+    let workloads = serde_json::json!({"items": items}).to_string();
+    Fixture::success(
+        f.command()
+            .env("WORKLOADS", workloads)
+            .args([
+                "--file",
+                "env/api.yaml",
+                "--file",
+                "env/override.yaml",
+                "--message",
+                "fix: both releases",
+                "--yes",
+                "--restart",
+                "all",
+            ])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(
+        f.log()
+            .lines()
+            .filter(|l| l.starts_with("helm:upgrade"))
+            .count(),
+        2
+    );
+    assert!(!f.log().contains("rollout restart"));
 }
