@@ -69,7 +69,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Apply manually edited YAML manifests and commit the selected changes
+    /// Apply manually edited manifests or Helm YAML and commit selected changes
     Apply(apply::ApplyArgs),
     /// Deploy a service to an environment
     Deploy {
