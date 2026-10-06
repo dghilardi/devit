@@ -174,6 +174,14 @@ rendered manifest directly.
 * After ConfigMap/Secret changes, the user can select referencing Deployments, StatefulSets, or
   DaemonSets for a rollout restart, followed by rollout monitoring. A workload whose pod template
   already changed and completed rollout after configuration application is not restarted again.
+* Interactive apply and configuration restarts use the pod-status and old/new log dashboard with
+  explicit rollout confirmation. Pod templates and restart annotations distinguish generations
+  when image tags are unchanged. Namespace, selector expressions, and container selection are retained.
+  Non-interactive runs preserve textual rollout monitoring. Dashboard watchers stop when logs close.
+* Helm upgrades run alongside the primary workload dashboard with rollback/wait retained. Closing
+  logs waits for Helm completion and leaves files uncommitted; subsequent workloads are monitored
+  after upgrade success. Controller generation must be observed before rollout completion, including
+  configuration changes that scale workloads to zero.
 * After success, selected files are committed and pushed once per repository, preserving other
   staged changes. This flow creates no release tags. Non-interactive execution requires explicit
   file selection, message, approval, and a configuration restart policy; dry-run makes no changes.

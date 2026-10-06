@@ -15,6 +15,7 @@ In maritime terms, a **davit** is a crane-like device used to safely lower lifeb
     -   **Dashboard Mode:** Real-time rollout monitoring with split-screen logs (`ratatui`).
 -   **Visual Diffs:** Preview infrastructure YAML changes before applying them.
 -   **Manual Configuration Changes:** Apply selected edited manifests or Helm values/chart YAML with `davit apply`, inspect diffs with `d`, choose their order, optionally restart dependent workloads, and commit only the selected files.
+-   **Configuration Rollout Logs:** Interactive apply and ConfigMap/Secret restarts use the live pod/log dashboard, including while Helm upgrades are running.
 -   **Helm & GitOps:** Discover ArgoCD Applications, update environment values, validate/render charts, and release through Helm or ArgoCD.
 -   **Live Helm Rollout:** Shows pod logs during the upgrade while preserving automatic rollback; closing the dashboard waits for Helm and leaves values uncommitted.
 -   **Automated Auditing:** Keeps the release state in Git; Direct Helm and manifest changes are committed after successful rollout; ArgoCD changes are committed before syncing the exact Git revision.
@@ -154,6 +155,14 @@ and lets you select which to restart. References in environment variables, volum
 volumes are supported. Workloads whose pod templates already changed and completed rollout after
 the configuration changes are excluded from the restart list.
 
+Interactive rollouts and dependent restarts open the same pod-status and old/new log dashboard as
+version deployments. Configuration monitoring compares pod templates and restart annotations, so
+pods are distinguished even when the image tag stays unchanged. Label selectors (including set-based
+expressions), namespace, and the workload's application container determine which pods/logs appear.
+Each workload is monitored separately; confirm completion to proceed or keep inspecting logs.
+Closing with **q** before confirmation stops the sequence and leaves selected changes uncommitted.
+Runs with `--non-interactive` continue to use textual `kubectl rollout status` output.
+
 After success, Davit creates one commit per repository and pushes it. Only selected files enter
 the commits, preserving unrelated staged files. No environment release tag is created. Files are
 applied from temporary snapshots; subsequent local edits abort the sequence before committing.
@@ -189,6 +198,9 @@ local chart, and ordered values files. All files selected for a release are comb
 `helm upgrade --install --atomic --wait`. A shared values file or chart change affects every
 referencing release in this environment, and the plan lists them all. Releases run in the order
 of their first selected input. Registry image discovery is not required and image tags are not rewritten.
+The primary workload's dashboard runs while Helm applies and waits, with automatic rollback retained.
+Closing logs waits for Helm to finish, including rollback on failure, and stops before committing.
+Other workloads in that release are monitored after Helm succeeds.
 
 Charts and values are rendered from Git HEAD plus only selected changes, then validated with
 `helm lint` and `helm template`. Other local changes remain excluded from the upgrade. Both rendering
