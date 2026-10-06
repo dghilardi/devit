@@ -354,8 +354,8 @@ pub fn preview(file: &Manifest) -> Result<String> {
     Ok(text)
 }
 
-pub fn upgrade(release: &Release, context: &str) -> Result<()> {
-    let mut command = Command::new("helm");
+pub async fn upgrade(release: &Release, context: &str) -> Result<()> {
+    let mut command = tokio::process::Command::new("helm");
     command
         .args(["upgrade", "--install", &release.name])
         .arg(&release.chart)
@@ -372,7 +372,10 @@ pub fn upgrade(release: &Release, context: &str) -> Result<()> {
     for values in &release.values {
         command.arg("-f").arg(values);
     }
-    let output = command.output().context("Failed to execute helm upgrade")?;
+    let output = command
+        .output()
+        .await
+        .context("Failed to execute helm upgrade")?;
     anyhow::ensure!(
         output.status.success(),
         "Helm upgrade failed for {} (output hidden to protect values); automatic rollback was requested",

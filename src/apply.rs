@@ -98,7 +98,7 @@ fn select_files(
     Ok(selected)
 }
 
-pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<()> {
+pub async fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<()> {
     let manifests = discover(env)?;
     if manifests.is_empty() {
         println!("No modified YAML manifests in {}.", env.name);
@@ -241,14 +241,14 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
         return Ok(());
     }
     let mut completed = Vec::new();
-    let execution = (|| -> Result<()> {
+    let execution: Result<()> = async {
         for (manifest, path) in selected.iter().zip(&paths) {
             for file in &files {
                 validate_unchanged(file)?;
             }
             println!("Applying {}", operation_label(manifest));
-            if let Some(release) = manifest.helm.first() {
-                crate::apply_helm::upgrade(release, &env.kubectl_context)?;
+            let monitored = if !manifest.helm.is_empty() {
+                crate::apply_monitor::helm(env, manifest, policy).await?
             } else {
                 let output = kubectl(env).args(["apply", "-f"]).arg(path).output()?;
                 anyhow::ensure!(
@@ -256,14 +256,17 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
                     "Application failed for {} (command output hidden because it may contain sensitive values)",
                     manifest.path.display()
                 );
-            }
+                None
+            };
             completed.push(operation_label(manifest));
             for resource in manifest.resources.iter().filter(|r| r.workload()) {
-                rollout(env, resource, false)?;
+                if monitored.as_ref() != Some(resource) {
+                    crate::apply_monitor::rollout(env, resource, false, policy).await?;
+                }
             }
         }
         if has_configuration && args.restart != Restart::Skip {
-            restart_dependents(env, &selected, args.restart, policy)?;
+            restart_dependents(env, &selected, args.restart, policy).await?;
         }
         for manifest in &files {
             validate_unchanged(manifest)?;
@@ -285,7 +288,7 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
             );
         }
         Ok(())
-    })();
+    }.await;
     if let Err(error) = execution {
         eprintln!("Sequence stopped. Successfully applied operations:");
         for path in &completed {
@@ -364,34 +367,7 @@ fn configuration_changes(manifest: &Manifest) -> Vec<Resource> {
         .collect()
 }
 
-fn rollout(env: &Environment, resource: &Resource, restart: bool) -> Result<()> {
-    if restart {
-        let status = kubectl(env)
-            .args([
-                "-n",
-                &resource.namespace,
-                "rollout",
-                "restart",
-                &resource.target(),
-            ])
-            .status()?;
-        anyhow::ensure!(status.success(), "Restart failed for {}", resource.target());
-    }
-    let status = kubectl(env)
-        .args([
-            "-n",
-            &resource.namespace,
-            "rollout",
-            "status",
-            &resource.target(),
-            "--timeout=300s",
-        ])
-        .status()?;
-    anyhow::ensure!(status.success(), "Rollout failed for {}", resource.target());
-    Ok(())
-}
-
-fn restart_dependents(
+async fn restart_dependents(
     env: &Environment,
     manifests: &[Manifest],
     restart: Restart,
@@ -488,7 +464,7 @@ fn restart_dependents(
         .collect()
     };
     for resource in selected {
-        rollout(env, &resource, true)?;
+        crate::apply_monitor::rollout(env, &resource, true, policy).await?;
     }
     Ok(())
 }
@@ -611,7 +587,7 @@ pub struct Resource {
 }
 
 impl Resource {
-    fn workload(&self) -> bool {
+    pub(crate) fn workload(&self) -> bool {
         matches!(
             self.kind.as_str(),
             "Deployment" | "StatefulSet" | "DaemonSet"

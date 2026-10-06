@@ -1,5 +1,6 @@
 mod apply;
 mod apply_helm;
+mod apply_monitor;
 mod blueprint;
 mod config;
 mod dashboard;
@@ -189,7 +190,7 @@ async fn main() -> Result<()> {
                     policy,
                 )?;
             }
-            apply::run(&env, args, policy)?;
+            apply::run(&env, args, policy).await?;
         }
         Commands::Deploy {
             env,
