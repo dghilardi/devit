@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Helm apply discovery now warns and skips unsupported or invalid Applications instead of blocking other applicable changes.
+
 ## [0.8.0] 2026-10-06
 
 ### Added

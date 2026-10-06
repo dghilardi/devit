@@ -820,3 +820,93 @@ fn multiple_helm_releases_with_changed_templates_do_not_restart_twice() {
     );
     assert!(!f.log().contains("rollout restart"));
 }
+
+#[test]
+fn unrelated_unsupported_or_invalid_applications_do_not_block_valid_helm_changes() {
+    for (unsupported, reason) in [
+        (
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: cnpg\nspec:\n  sources:\n  - repoURL: https://cloudnative-pg.github.io/charts\n    chart: cloudnative-pg\n    targetRevision: 0.28.2\n    helm:\n      valueFiles:\n      - $values/env/cnpg.yaml\n  - ref: values\n",
+            "Remote Helm chart 'cloudnative-pg'",
+        ),
+        (
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: other\nspec:\n  source:\n    chart: other\n",
+            "spec.sources",
+        ),
+        ("kind: Application\nspec: [broken\n", "Invalid YAML"),
+        (
+            "apiVersion: argoproj.io/v1alpha1\nkind: Application\nmetadata:\n  name: inline\nspec:\n  sources:\n  - path: charts/app\n    helm:\n      valuesObject:\n        setting: inline\n",
+            "inline Helm overrides",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.helm_source();
+        let repo = f.dir.path().join("repo");
+        fs::write(
+            repo.join("clusters/test/apps/unsupported.yaml"),
+            unsupported,
+        )
+        .unwrap();
+        fs::write(repo.join("env/api.yaml"), "setting: selected\n").unwrap();
+        let output = f
+            .command()
+            .args(["--file", "env/api.yaml", "--dry-run"])
+            .output()
+            .unwrap();
+        let warnings = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            warnings.contains("Skipping")
+                && warnings.contains("unsupported.yaml")
+                && warnings.contains(reason),
+            "{warnings}"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("Helm api-release"));
+        Fixture::success(output);
+        assert!(!f.log().contains("helm:upgrade"));
+        assert!(!f.log().contains(" apply "));
+    }
+}
+
+#[test]
+fn valid_application_after_unsupported_document_in_same_file_is_discovered() {
+    let f = Fixture::new();
+    f.helm_source();
+    let repo = f.dir.path().join("repo");
+    let path = repo.join("clusters/test/apps/api.yaml");
+    let valid = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        format!("kind: Application\nspec:\n  sources:\n  - chart: unsupported\n---\n{valid}"),
+    )
+    .unwrap();
+    git(&repo, &["add", "clusters/test/apps/api.yaml"]);
+    git(&repo, &["commit", "-m", "mixed application documents"]);
+    fs::write(repo.join("env/api.yaml"), "setting: selected\n").unwrap();
+    let output = f
+        .command()
+        .args(["--file", "env/api.yaml", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Remote Helm chart 'unsupported'"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Helm api-release"));
+    Fixture::success(output);
+}
+
+#[test]
+fn unsupported_remote_chart_values_cannot_be_applied() {
+    let f = Fixture::new();
+    f.helm_source();
+    let repo = f.dir.path().join("repo");
+    fs::write(repo.join("clusters/test/apps/cnpg.yaml"), "kind: Application\nspec:\n  sources:\n  - chart: cloudnative-pg\n    helm:\n      valueFiles:\n      - $values/env/cnpg.yaml\n").unwrap();
+    fs::write(repo.join("env/cnpg.yaml"), "setting: remote\n").unwrap();
+    fs::write(repo.join("env/api.yaml"), "setting: selected\n").unwrap();
+    let output = f
+        .command()
+        .args(["--file", "env/cnpg.yaml", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("not an unambiguous modified manifest")
+    );
+    assert!(f.log().is_empty());
+}

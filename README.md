@@ -196,6 +196,8 @@ and upgrade use the release namespace and all values files in declaration order.
 local rendering and does not access the cluster. Chart dependencies must be available in Git HEAD.
 
 Helm apply currently supports local charts and file-based Application `spec.sources` configuration.
+Unsupported or invalid Applications are reported and skipped individually; a remote chart such as
+CloudNativePG does not block discovery of other releases. Their values cannot be selected for apply.
 Application routing changes must be committed separately, and inline Helm overrides are rejected.
 The chart and its existing values must render successfully at Git HEAD. Only YAML inputs are
 selectable; changes to `.tpl` helpers or other chart files must be committed separately before applying.
