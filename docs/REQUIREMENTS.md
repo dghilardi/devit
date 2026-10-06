@@ -159,12 +159,13 @@ rendered manifest directly.
 
 ---
 
-### 3.8 Applying Manual Manifest Changes
+### 3.8 Applying Manual YAML Changes
 
 * `davit apply` discovers modified, staged, and new YAML files within the chosen environment's
-  manifest sources. Helm/ArgoCD sources are skipped; deleted files do not trigger cluster deletion.
+  manifest and direct Helm sources. ArgoCD sources are skipped; deleted files do not trigger cluster deletion.
 * A multiple-selection terminal screen provides `d` for a diff of the highlighted file against
-  Git HEAD, Space for selection, J/K for application order, and Enter for confirmation.
+  Git HEAD (rendered Kubernetes changes for Helm), Space for selection, J/K for application order,
+  and Enter for confirmation. The final Helm preview combines all selected inputs.
 * Secret payloads and annotations are hidden in local previews; live diffs containing Secrets
   are suppressed. Files retain their original formatting on disk.
 * The user supplies a commit message. All selected snapshots receive server-side validation and
@@ -176,8 +177,17 @@ rendered manifest directly.
 * After success, selected files are committed and pushed once per repository, preserving other
   staged changes. This flow creates no release tags. Non-interactive execution requires explicit
   file selection, message, approval, and a configuration restart policy; dry-run makes no changes.
+* Direct Helm changes are grouped into one upgrade per affected release, including all references
+  to a shared chart or values file. Release order follows the first selected input. Helm metadata
+  discovery does not require a registry image, and all declared values files and the release namespace
+  are retained. Image tags are not rewritten.
+* Helm charts and values are snapshotted from Git HEAD plus selected files only, linted, rendered,
+  validated, and upgraded with `--atomic --wait`. Unselected working-copy changes remain excluded.
+  Chart dependencies must exist in Git HEAD; Application routing changes, inline overrides, and
+  uncommitted non-YAML chart inputs are outside this flow. Helm dry-run renders locally.
 * Processing stops on the first error and reports partial application, retaining local edits.
-  Applied resources are not automatically rolled back, and separate repositories are not a single
+  Failed Helm upgrades request automatic rollback; successful earlier operations remain applied.
+  Separate repositories are not a single
   Git transaction. Edits made after selection abort the sequence before committing unapplied content.
 
 ---

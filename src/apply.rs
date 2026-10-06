@@ -14,7 +14,7 @@ use crate::prompt::PromptPolicy;
 pub struct ApplyArgs {
     #[arg(short, long)]
     pub env: Option<String>,
-    /// Select a modified manifest (repeat for multiple files, in application order)
+    /// Select a modified manifest or Helm YAML (repeat in application order)
     #[arg(short, long)]
     pub file: Vec<PathBuf>,
     /// Commit message; requested interactively when omitted
@@ -104,8 +104,8 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
         println!("No modified YAML manifests in {}.", env.name);
         return Ok(());
     }
-    let mut selected = select_files(&manifests, &args.file, policy)?;
-    if selected.is_empty() {
+    let files = select_files(&manifests, &args.file, policy)?;
+    if files.is_empty() {
         println!("Application cancelled.");
         return Ok(());
     }
@@ -113,12 +113,33 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
         "Application plan for {} (context {}):",
         env.name, env.kubectl_context
     );
-    for (index, manifest) in selected.iter().enumerate() {
+    for (index, manifest) in files.iter().enumerate() {
         println!("{}. {}", index + 1, manifest.path.display());
+    }
+    for file in &files {
+        validate_unchanged(file)?;
+    }
+    let prepared = crate::apply_helm::prepare(&files)?;
+    let mut selected = prepared.operations.clone();
+    for manifest in &selected {
+        if let Some(release) = manifest.helm.first() {
+            println!("{} — rendered change:", release.label());
+        }
         println!("{}", diff(manifest)?);
     }
     if args.dry_run {
         for manifest in &selected {
+            if let Some(release) = manifest.helm.first() {
+                println!(
+                    "Dry-run: helm upgrade --install {} {} --kube-context {} --namespace {} --atomic --wait (selected snapshot, {} values file(s))",
+                    release.name,
+                    release.chart.display(),
+                    env.kubectl_context,
+                    release.namespace,
+                    release.values.len()
+                );
+                continue;
+            }
             println!(
                 "Dry-run: kubectl --context {} apply --dry-run=server -f {}",
                 env.kubectl_context,
@@ -144,7 +165,7 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
     anyhow::ensure!(!message.trim().is_empty(), "Commit message cannot be empty");
     let has_configuration = selected
         .iter()
-        .any(|m| m.resources.iter().any(Resource::configuration));
+        .any(|m| !configuration_changes(m).is_empty());
     if has_configuration && args.restart == Restart::Ask && !policy.is_interactive() {
         return Err(policy.cannot_ask(
             "dependent workload restarts",
@@ -171,8 +192,7 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
     for (index, manifest) in selected.iter().enumerate() {
         let path = snapshots.path().join(format!("{index}.yaml"));
         fs::write(&path, &manifest.content)?;
-        validate_unchanged(manifest)?;
-        let output = kubectl(env)
+        let output = operation_command(env, manifest)
             .args(["apply", "--dry-run=server", "-f"])
             .arg(&path)
             .output()?;
@@ -191,7 +211,10 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
         paths.push(path);
     }
     for (manifest, path) in selected.iter().zip(&paths) {
-        let output = kubectl(env).args(["diff", "-f"]).arg(path).output()?;
+        let output = operation_command(env, manifest)
+            .args(["diff", "-f"])
+            .arg(path)
+            .output()?;
         anyhow::ensure!(
             matches!(output.status.code(), Some(0 | 1)),
             "Cluster diff failed for {} (output hidden because it may contain sensitive values). Nothing applied.",
@@ -220,15 +243,21 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
     let mut completed = Vec::new();
     let execution = (|| -> Result<()> {
         for (manifest, path) in selected.iter().zip(&paths) {
-            validate_unchanged(manifest)?;
-            println!("Applying {}", manifest.path.display());
-            let output = kubectl(env).args(["apply", "-f"]).arg(path).output()?;
-            anyhow::ensure!(
-                output.status.success(),
-                "Application failed for {} (command output hidden because it may contain sensitive values)",
-                manifest.path.display()
-            );
-            completed.push(manifest.path.clone());
+            for file in &files {
+                validate_unchanged(file)?;
+            }
+            println!("Applying {}", operation_label(manifest));
+            if let Some(release) = manifest.helm.first() {
+                crate::apply_helm::upgrade(release, &env.kubectl_context)?;
+            } else {
+                let output = kubectl(env).args(["apply", "-f"]).arg(path).output()?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "Application failed for {} (command output hidden because it may contain sensitive values)",
+                    manifest.path.display()
+                );
+            }
+            completed.push(operation_label(manifest));
             for resource in manifest.resources.iter().filter(|r| r.workload()) {
                 rollout(env, resource, false)?;
             }
@@ -236,11 +265,11 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
         if has_configuration && args.restart != Restart::Skip {
             restart_dependents(env, &selected, args.restart, policy)?;
         }
-        for manifest in &selected {
+        for manifest in &files {
             validate_unchanged(manifest)?;
         }
         let mut repos: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
-        for manifest in &selected {
+        for manifest in &files {
             repos
                 .entry(manifest.repo.clone())
                 .or_default()
@@ -258,27 +287,27 @@ pub fn run(env: &Environment, args: ApplyArgs, policy: PromptPolicy) -> Result<(
         Ok(())
     })();
     if let Err(error) = execution {
-        eprintln!("Sequence stopped. Successfully applied files:");
+        eprintln!("Sequence stopped. Successfully applied operations:");
         for path in &completed {
-            eprintln!("  {}", path.display());
+            eprintln!("  {}", path);
         }
-        eprintln!("Unapplied files:");
+        eprintln!("Unfinished operations:");
         for manifest in &selected {
-            if !completed.contains(&manifest.path) {
+            if !completed.contains(&operation_label(manifest)) {
                 eprintln!(
                     "  {} (a failed apply may have changed some resources)",
-                    manifest.path.display()
+                    operation_label(manifest)
                 );
             }
         }
         eprintln!(
-            "Local edits are retained. Check cluster and Git state before retrying; no automatic rollback was performed."
+            "Local edits are retained. Check cluster and Git state before retrying. Successful earlier operations are retained; failed Helm upgrades request automatic rollback."
         );
         return Err(error);
     }
     println!(
         "Applied {} file(s) successfully. Configuration saved without a release tag.",
-        selected.len()
+        files.len()
     );
     Ok(())
 }
@@ -290,6 +319,49 @@ fn validate_unchanged(manifest: &Manifest) -> Result<()> {
         manifest.path.display()
     );
     Ok(())
+}
+
+fn operation_command(env: &Environment, manifest: &Manifest) -> Command {
+    let mut command = kubectl(env);
+    if let Some(release) = manifest.helm.first() {
+        command.args(["-n", &release.namespace]);
+    }
+    command
+}
+
+fn operation_label(manifest: &Manifest) -> String {
+    manifest
+        .helm
+        .first()
+        .map(|r| r.label())
+        .unwrap_or_else(|| manifest.path.display().to_string())
+}
+
+/// Helm renders all resources, so unchanged configuration must not trigger restarts.
+fn configuration_changes(manifest: &Manifest) -> Vec<Resource> {
+    let Ok(old) = documents(&manifest.original) else {
+        return Vec::new();
+    };
+    let Ok(new) = documents(&manifest.content) else {
+        return Vec::new();
+    };
+    manifest
+        .resources
+        .iter()
+        .filter(|r| r.configuration())
+        .filter(|resource| {
+            let matches = |doc: &&Value| {
+                doc["kind"].as_str() == Some(&resource.kind)
+                    && doc["metadata"]["name"].as_str() == Some(&resource.name)
+                    && doc["metadata"]["namespace"]
+                        .as_str()
+                        .unwrap_or(&resource.namespace)
+                        == resource.namespace
+            };
+            old.iter().find(matches) != new.iter().find(matches)
+        })
+        .cloned()
+        .collect()
 }
 
 fn rollout(env: &Environment, resource: &Resource, restart: bool) -> Result<()> {
@@ -325,17 +397,8 @@ fn restart_dependents(
     restart: Restart,
     policy: PromptPolicy,
 ) -> Result<()> {
-    let configs: Vec<_> = manifests
-        .iter()
-        .flat_map(|m| &m.resources)
-        .filter(|r| r.configuration())
-        .cloned()
-        .collect();
+    let configs: Vec<_> = manifests.iter().flat_map(configuration_changes).collect();
     let mut applied = BTreeSet::new();
-    let last_config = manifests
-        .iter()
-        .rposition(|m| m.resources.iter().any(Resource::configuration))
-        .unwrap_or(0);
     for (index, manifest) in manifests.iter().enumerate() {
         let old = documents(&manifest.original)?;
         let new = documents(&manifest.content)?;
@@ -350,7 +413,15 @@ fn restart_dependents(
             };
             let before = old.iter().find(matches);
             let after = new.iter().find(matches);
-            if index >= last_config
+            let pod = serde_json::to_value(after.map(|v| &v["spec"]["template"]["spec"]))?;
+            let later_dependency = manifests[index + 1..]
+                .iter()
+                .flat_map(configuration_changes)
+                .any(|config| {
+                    config.namespace == resource.namespace
+                        && references(&pod, &config.kind, &config.name)
+                });
+            if !later_dependency
                 && before.map(|v| &v["spec"]["template"]) != after.map(|v| &v["spec"]["template"])
             {
                 applied.insert(resource.clone());
@@ -528,6 +599,8 @@ pub struct Manifest {
     pub content: String,
     pub original: String,
     pub resources: Vec<Resource>,
+    pub helm: Vec<crate::apply_helm::Release>,
+    pub rendered: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -562,7 +635,7 @@ pub fn documents(content: &str) -> Result<Vec<Value>> {
         .context("Invalid YAML")
 }
 
-fn resources(content: &str) -> Result<Vec<Resource>> {
+pub(crate) fn resources(content: &str) -> Result<Vec<Resource>> {
     let mut result = Vec::new();
     for doc in documents(content)? {
         anyhow::ensure!(doc["apiVersion"].as_str().is_some(), "Missing apiVersion");
@@ -606,6 +679,9 @@ pub fn redacted(content: &str) -> Result<String> {
 }
 
 pub fn diff(manifest: &Manifest) -> Result<String> {
+    if !manifest.helm.is_empty() && !manifest.rendered {
+        return crate::apply_helm::preview(manifest);
+    }
     let secret = manifest.resources.iter().any(|r| r.kind == "Secret")
         || documents(&manifest.original)?
             .iter()
@@ -636,9 +712,9 @@ pub fn discover(env: &Environment) -> Result<Vec<Manifest>> {
     let mut paths = BTreeSet::new();
     let mut result = Vec::new();
     for source in sources {
-        if source.driver != DeploymentDriver::Manifest {
+        if source.driver == DeploymentDriver::ArgoCd {
             println!(
-                "Skipping {}: apply currently supports manifest sources only.",
+                "Skipping {}: apply does not yet support ArgoCD sources.",
                 source.name
             );
             continue;
@@ -649,6 +725,11 @@ pub fn discover(env: &Environment) -> Result<Vec<Manifest>> {
             .with_context(|| format!("Cannot read {}", source.root.display()))?;
         let repo =
             Git::repo_root(&root).context("Manifest sources must belong to a Git repository")?;
+        let releases = if source.driver == DeploymentDriver::Helm {
+            crate::apply_helm::discover(&source)?
+        } else {
+            Vec::new()
+        };
         for args in [
             vec!["diff", "--name-only", "-z", "HEAD", "--"],
             vec!["ls-files", "--others", "--exclude-standard", "-z", "--"],
@@ -696,14 +777,35 @@ pub fn discover(env: &Environment) -> Result<Vec<Manifest>> {
                     "Manifest paths through symlink directories are unsupported: {}",
                     path.display()
                 );
-                if excluded.iter().any(|p| canonical.starts_with(p))
-                    || !paths.insert(canonical.clone())
+                if source.driver == DeploymentDriver::Manifest
+                    && excluded
+                        .iter()
+                        .any(|p| p.starts_with(&root) && canonical.starts_with(p))
                 {
                     continue;
                 }
                 let content = fs::read_to_string(&canonical)?;
-                let parsed = resources(&content)
-                    .with_context(|| format!("Invalid manifest {}", path.display()))?;
+                let helm: Vec<_> = releases
+                    .iter()
+                    .filter(|r| r.includes(&canonical))
+                    .cloned()
+                    .collect();
+                if source.driver == DeploymentDriver::Helm && helm.is_empty() {
+                    println!(
+                        "Skipping {}: not a values/chart YAML of a configured Helm release.",
+                        relative.display()
+                    );
+                    continue;
+                }
+                if !paths.insert(canonical.clone()) {
+                    continue;
+                }
+                let parsed = if helm.is_empty() {
+                    resources(&content)
+                        .with_context(|| format!("Invalid manifest {}", path.display()))?
+                } else {
+                    crate::apply_helm::placeholders(&helm)
+                };
                 let output = Command::new("git")
                     .arg("-C")
                     .arg(&repo)
@@ -721,6 +823,8 @@ pub fn discover(env: &Environment) -> Result<Vec<Manifest>> {
                     content,
                     original,
                     resources: parsed,
+                    helm,
+                    rendered: false,
                 });
             }
         }
@@ -880,6 +984,8 @@ mod tests {
             repo: ".".into(),
             relative: "secret.yaml".into(),
             resources: resources(&current).unwrap(),
+            helm: Vec::new(),
+            rendered: false,
             content: current,
             original: secret("old-secret"),
         };

@@ -14,7 +14,7 @@ In maritime terms, a **davit** is a crane-like device used to safely lower lifeb
     -   **Wizard Mode:** Interactive selection of environments, services, and image tags (`inquire`).
     -   **Dashboard Mode:** Real-time rollout monitoring with split-screen logs (`ratatui`).
 -   **Visual Diffs:** Preview infrastructure YAML changes before applying them.
--   **Manual Configuration Changes:** Apply selected edited manifests with `davit apply`, inspect diffs with `d`, choose their order, optionally restart dependent workloads, and commit only the selected files.
+-   **Manual Configuration Changes:** Apply selected edited manifests or Helm values/chart YAML with `davit apply`, inspect diffs with `d`, choose their order, optionally restart dependent workloads, and commit only the selected files.
 -   **Helm & GitOps:** Discover ArgoCD Applications, update environment values, validate/render charts, and release through Helm or ArgoCD.
 -   **Live Helm Rollout:** Shows pod logs during the upgrade while preserving automatic rollback; closing the dashboard waits for Helm and leaves values uncommitted.
 -   **Automated Auditing:** Keeps the release state in Git; Direct Helm and manifest changes are committed after successful rollout; ArgoCD changes are committed before syncing the exact Git revision.
@@ -30,6 +30,7 @@ In maritime terms, a **davit** is a crane-like device used to safely lower lifeb
 -   `gcloud`
 -   `git`
 -   `helm` for Helm-backed environments
+-   `tar` for Git snapshots when applying Helm changes
 -   `argocd` for environments using the `argo-cd` deployment driver
 
 ### Configuration
@@ -129,23 +130,26 @@ davit list envs
 davit list services --env staging
 ```
 
-### Applying manually edited manifests
+### Applying manually edited YAML
 
-Use `davit apply --env staging` after editing YAML files by hand. This first version supports
-`manifest` sources; Helm and ArgoCD sources are explicitly skipped. Modified files (staged or
+Use `davit apply --env staging` after editing YAML files by hand. Both `manifest` and direct `helm`
+sources are supported; ArgoCD sources are explicitly skipped. Modified files (staged or
 unstaged) and new, non-ignored `.yaml`/`.yml` files inside the environment's configured sources
-are discovered. Deleted files are reported and skipped; this command does not delete resources.
+are discovered. Deleted files are reported and skipped; standalone manifests never trigger cluster
+deletion. Helm upgrades retain Helm's normal resource lifecycle.
 
 In the selection screen, use **Space** to select files, **d** to preview the highlighted file's
 diff against Git HEAD, **Esc** to return from the diff, and **J/K** to move a file down/up in the
 application order. **Enter** confirms the selection; **Esc** in the list cancels. Arrow keys move
 through the list or scroll the diff. Secret payloads, including annotations, are hidden; changes
-to their hidden values may therefore not appear in the diff.
+to their hidden values may therefore not appear in the diff. For Helm YAML, **d** previews the
+rendered Kubernetes changes caused by that file, with Secret payloads hidden. The final plan
+combines all selected files and shows the rendered diff for each affected release.
 
 Davit asks for a commit message, validates all selected snapshots with a server dry run, and
 shows the cluster diff before final approval. Cluster diffs for files containing Secrets are
-hidden. It applies files in the selected order and waits for Deployment, StatefulSet, and DaemonSet
-rollouts. For ConfigMaps and Secrets, it offers to discover referencing workloads in the cluster
+hidden. It applies manifests or upgrades Helm releases in selection order and waits for Deployment,
+StatefulSet, and DaemonSet rollouts. For changed ConfigMaps and Secrets, it offers to discover referencing workloads in the cluster
 and lets you select which to restart. References in environment variables, volumes, and projected
 volumes are supported. Workloads whose pod templates already changed and completed rollout after
 the configuration changes are excluded from the restart list.
@@ -153,8 +157,9 @@ the configuration changes are excluded from the restart list.
 After success, Davit creates one commit per repository and pushes it. Only selected files enter
 the commits, preserving unrelated staged files. No environment release tag is created. Files are
 applied from temporary snapshots; subsequent local edits abort the sequence before committing.
-At the first failure, processing stops with a summary of applied and unapplied files. Local edits
-are retained; cluster changes already made are not automatically rolled back. Git operations
+At the first failure, processing stops with a summary of completed and unfinished operations. Local edits
+are retained. Failed Helm upgrades request automatic rollback; successful earlier upgrades and
+manifest applications remain applied. Git operations
 across repositories are independent, so a later failure can leave earlier repositories pushed.
 
 ```bash
@@ -173,7 +178,27 @@ davit apply --env staging \
 # Explicitly restart all discovered dependent workloads
 davit apply --env staging --file k8s/staging/config.yaml \
   --message "fix(config): update settings" --yes --restart all
+
+# Apply edited Helm values without choosing a new image tag
+davit apply --env staging --file clusters/staging/values/api.yaml \
+  --message "fix(config): adjust API settings" --yes --restart skip
 ```
+
+Direct Helm sources use the configured Application metadata to identify the release, namespace,
+local chart, and ordered values files. All files selected for a release are combined into one
+`helm upgrade --install --atomic --wait`. A shared values file or chart change affects every
+referencing release in this environment, and the plan lists them all. Releases run in the order
+of their first selected input. Registry image discovery is not required and image tags are not rewritten.
+
+Charts and values are rendered from Git HEAD plus only selected changes, then validated with
+`helm lint` and `helm template`. Other local changes remain excluded from the upgrade. Both rendering
+and upgrade use the release namespace and all values files in declaration order. Helm dry-run uses
+local rendering and does not access the cluster. Chart dependencies must be available in Git HEAD.
+
+Helm apply currently supports local charts and file-based Application `spec.sources` configuration.
+Application routing changes must be committed separately, and inline Helm overrides are rejected.
+The chart and its existing values must render successfully at Git HEAD. Only YAML inputs are
+selectable; changes to `.tpl` helpers or other chart files must be committed separately before applying.
 
 Absolute paths and paths relative to the current directory are also accepted. If the same
 repository-relative path matches multiple source repositories, pass an absolute path.
