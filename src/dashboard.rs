@@ -66,6 +66,7 @@ pub struct Dashboard {
     auto_close_on_rollout_complete: bool,
     deployment_rx: Option<oneshot::Receiver<std::result::Result<(), String>>>,
     deployment_pending: bool,
+    configuration_template: Option<serde_json::Value>,
 }
 
 struct LogLine {
@@ -91,6 +92,17 @@ struct PodInfo {
 struct RolloutStatus {
     template_matches_tag: bool,
     workload_complete: bool,
+    no_pods_expected: bool,
+}
+
+struct DashboardTasks(Vec<tokio::task::JoinHandle<()>>);
+
+impl Drop for DashboardTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
 }
 
 impl Dashboard {
@@ -133,7 +145,32 @@ impl Dashboard {
             auto_close_on_rollout_complete,
             deployment_rx: None,
             deployment_pending: false,
+            configuration_template: None,
         }
+    }
+
+    pub fn with_configuration_template(mut self, template: serde_json::Value) -> Self {
+        self.configuration_template = Some(template);
+        self
+    }
+
+    fn is_new_pod(&self, pod: &Pod) -> bool {
+        if let Some(template) = &self.configuration_template {
+            let Ok(actual) = serde_json::to_value(pod) else {
+                return false;
+            };
+            return configuration_matches(template, &actual);
+        }
+        pod.spec
+            .as_ref()
+            .and_then(|spec| {
+                spec.containers
+                    .iter()
+                    .find(|c| c.name == self.container_name)
+                    .or_else(|| spec.containers.first())
+            })
+            .and_then(|container| container.image.as_ref())
+            .is_some_and(|image| image.contains(&self.tag))
     }
 
     pub fn monitor_deployment(
@@ -209,27 +246,32 @@ impl Dashboard {
             .clone()
             .unwrap_or_else(|| format!("app={}", self.service));
         let lp = ListParams::default().labels(&selector);
+        let mut background_tasks = DashboardTasks(Vec::new());
 
         let pod_tx = self.pod_tx.clone();
         let pods_api_refresh = pods_api.clone();
         let lp_refresh = lp.clone();
-        tokio::spawn(async move {
+        background_tasks.0.push(tokio::spawn(async move {
             loop {
                 if let Ok(pod_list) = pods_api_refresh.list(&lp_refresh).await {
                     let _ = pod_tx.send(pod_list.items);
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
-        });
+        }));
 
         let rollout_tx = self.rollout_tx.clone();
         let rollout_kind = self.workload_kind.clone();
         let rollout_name = self.service.clone();
-        let rollout_tag = self.tag.clone();
+        let rollout_tag = if self.configuration_template.is_some() {
+            String::new()
+        } else {
+            self.tag.clone()
+        };
         let rollout_container_name = self.container_name.clone();
         let rollout_client = client.clone();
         let rollout_namespace = namespace.clone();
-        tokio::spawn(async move {
+        background_tasks.0.push(tokio::spawn(async move {
             loop {
                 if let Ok(status) = fetch_rollout_status(
                     rollout_client.clone(),
@@ -245,7 +287,7 @@ impl Dashboard {
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
-        });
+        }));
 
         let mut last_header_refresh = Instant::now();
         let mut needs_redraw = true;
@@ -268,18 +310,7 @@ impl Dashboard {
                         .and_then(|s| s.phase.clone())
                         .unwrap_or_else(|| "Unknown".to_string());
 
-                    let is_new = p
-                        .spec
-                        .as_ref()
-                        .and_then(|s| {
-                            s.containers
-                                .iter()
-                                .find(|c| c.name == self.container_name)
-                                .or_else(|| s.containers.first())
-                        })
-                        .and_then(|c| c.image.as_ref())
-                        .map(|image| image.contains(&self.tag))
-                        .unwrap_or(false);
+                    let is_new = self.is_new_pod(&p);
 
                     if !self.tailed_pods.contains(&name) && status == "Running" {
                         self.tailed_pods.insert(name.clone());
@@ -287,7 +318,7 @@ impl Dashboard {
                         let api = pods_api.clone();
                         let p_name = name.clone();
                         let container = self.container_name.clone();
-                        tokio::spawn(async move {
+                        background_tasks.0.push(tokio::spawn(async move {
                             let lp = LogParams {
                                 follow: true,
                                 tail_lines: Some(10),
@@ -361,7 +392,7 @@ impl Dashboard {
                                     });
                                 }
                             }
-                        });
+                        }));
                     }
 
                     let container_statuses = p
@@ -509,9 +540,14 @@ impl Dashboard {
         } else {
             "Monitoring rollout (q closes logs)"
         };
+        let target_label = if self.configuration_template.is_some() {
+            "Change"
+        } else {
+            "Tag"
+        };
         let header = Paragraph::new(format!(
-            " Davit Rollout: {} | Env: {} | Tag: {} | {}",
-            self.service, self.env_name, self.tag, phase
+            " Davit Rollout: {} | Env: {} | {}: {} | {}",
+            self.service, self.env_name, target_label, self.tag, phase
         ))
         .block(Block::default().borders(Borders::ALL));
         f.render_widget(header, chunks[0]);
@@ -622,6 +658,11 @@ impl Dashboard {
     }
 
     fn is_rollout_complete(&self) -> bool {
+        if self.configuration_template.is_some() && self.rollout_status.no_pods_expected {
+            return !self.deployment_pending
+                && self.pods.is_empty()
+                && self.rollout_status.workload_complete;
+        }
         let has_new_pods = self.pods.iter().any(|pod| pod.is_new);
         let old_pods_gone = self.pods.iter().all(|pod| pod.is_new);
         let new_pods_ready = self
@@ -640,7 +681,11 @@ impl Dashboard {
 
     fn render_completion_modal(&self, f: &mut Frame) {
         let area = centered_rect(72, 9, f.area());
-        let text = "Release rollout completed.\nAll impacted pods are on the requested tag and reported ready.\n\nEnter/c: close dashboard and continue\nEsc/k: keep dashboard open";
+        let text = if self.configuration_template.is_some() {
+            "Configuration rollout completed.\nAll impacted pods match the requested configuration and reported ready.\n\nEnter/c: close dashboard and continue\nEsc/k: keep dashboard open"
+        } else {
+            "Release rollout completed.\nAll impacted pods are on the requested tag and reported ready.\n\nEnter/c: close dashboard and continue\nEsc/k: keep dashboard open"
+        };
         let modal = Paragraph::new(text)
             .block(
                 Block::default()
@@ -705,6 +750,42 @@ async fn fetch_rollout_status(
     }
 }
 
+fn generation_observed(generation: Option<i64>, observed: Option<i64>) -> bool {
+    observed.unwrap_or(0) >= generation.unwrap_or(0)
+}
+
+/// Pod defaulting and injected sidecars add fields; compare the requested subset.
+fn contains_configuration(expected: &serde_json::Value, actual: &serde_json::Value) -> bool {
+    match expected {
+        serde_json::Value::Null => true,
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .all(|(key, value)| contains_configuration(value, &actual[key])),
+        serde_json::Value::Array(values) => actual.as_array().is_some_and(|items| {
+            values.iter().enumerate().all(|(index, value)| {
+                let candidate = if let Some(name) = value["name"].as_str() {
+                    items
+                        .iter()
+                        .find(|item| item["name"].as_str() == Some(name))
+                } else {
+                    items.get(index)
+                };
+                candidate.is_some_and(|item| contains_configuration(value, item))
+            })
+        }),
+        _ => expected == actual,
+    }
+}
+
+fn configuration_matches(template: &serde_json::Value, pod: &serde_json::Value) -> bool {
+    contains_configuration(&template["metadata"]["labels"], &pod["metadata"]["labels"])
+        && contains_configuration(
+            &template["metadata"]["annotations"],
+            &pod["metadata"]["annotations"],
+        )
+        && contains_configuration(&template["spec"], &pod["spec"])
+}
+
 impl RolloutStatus {
     fn from_deployment(deployment: &Deployment, tag: &str, container_name: &str) -> Self {
         let spec = deployment.spec.as_ref();
@@ -717,7 +798,11 @@ impl RolloutStatus {
 
         Self {
             template_matches_tag: workload_template_matches_tag(spec, container_name, tag),
-            workload_complete: desired > 0
+            no_pods_expected: tag.is_empty() && desired == 0,
+            workload_complete: generation_observed(
+                deployment.metadata.generation,
+                status.and_then(|s| s.observed_generation),
+            ) && (desired > 0 || tag.is_empty() && desired == 0)
                 && ready_replicas.unwrap_or(0) >= desired
                 && available_replicas.unwrap_or(0) >= desired
                 && updated_replicas.unwrap_or(0) >= desired,
@@ -734,7 +819,11 @@ impl RolloutStatus {
 
         Self {
             template_matches_tag: workload_template_matches_tag(spec, container_name, tag),
-            workload_complete: desired > 0
+            no_pods_expected: tag.is_empty() && desired == 0,
+            workload_complete: generation_observed(
+                statefulset.metadata.generation,
+                status.and_then(|s| s.observed_generation),
+            ) && (desired > 0 || tag.is_empty() && desired == 0)
                 && ready_replicas.unwrap_or(0) >= desired
                 && updated_replicas.unwrap_or(0) >= desired,
         }
@@ -751,7 +840,11 @@ impl RolloutStatus {
 
         Self {
             template_matches_tag: workload_template_matches_tag(spec, container_name, tag),
-            workload_complete: desired > 0
+            no_pods_expected: tag.is_empty() && desired == 0,
+            workload_complete: generation_observed(
+                daemonset.metadata.generation,
+                status.and_then(|s| s.observed_generation),
+            ) && (desired > 0 || tag.is_empty() && desired == 0)
                 && ready_replicas.unwrap_or(0) >= desired
                 && available_replicas.unwrap_or(0) >= desired
                 && updated_replicas.unwrap_or(0) >= desired,
@@ -841,6 +934,74 @@ fn format_age(created: k8s_openapi::jiff::Timestamp) -> String {
 mod deployment_tests {
     use super::*;
 
+    #[test]
+    fn configuration_restart_separates_old_and_new_pods_with_the_same_image() {
+        let template = serde_json::json!({
+            "metadata": {"labels": {"app": "api"}, "annotations": {"kubectl.kubernetes.io/restartedAt": "new"}},
+            "spec": {"containers": [{"name": "api", "image": "nginx:1", "env": [{"name": "SETTING", "value": "new"}]}]}
+        });
+        let old = serde_json::json!({
+            "metadata": {"labels": {"app": "api"}, "annotations": {"kubectl.kubernetes.io/restartedAt": "old"}},
+            "spec": {"containers": [{"name": "api", "image": "nginx:1", "env": [{"name": "SETTING", "value": "new"}]}]}
+        });
+        assert!(!configuration_matches(&template, &old));
+        let mut new = template.clone();
+        new["metadata"]["labels"]["pod-template-hash"] = "hash".into();
+        new["spec"]["containers"].as_array_mut().unwrap().insert(
+            0,
+            serde_json::json!({"name": "sidecar", "image": "proxy:1"}),
+        );
+        new["spec"]["dnsPolicy"] = "ClusterFirst".into();
+        assert!(configuration_matches(&template, &new));
+        new["spec"]["containers"][1]["env"][0]["value"] = "old".into();
+        assert!(!configuration_matches(&template, &new));
+    }
+
+    #[test]
+    fn configuration_mode_does_not_require_image_tag_changes() {
+        let mut dashboard = ready_dashboard();
+        dashboard.configuration_template = Some(serde_json::json!({
+            "spec": {"containers": [{"name": "service", "image": "nginx:1"}]}
+        }));
+        let pod: Pod = serde_json::from_value(
+            serde_json::json!({"spec": {"containers": [{"name": "service", "image": "nginx:1"}]}}),
+        )
+        .unwrap();
+        assert!(dashboard.is_new_pod(&pod));
+    }
+
+    #[test]
+    fn stale_controller_generation_does_not_complete_rollout() {
+        let mut deployment: Deployment = serde_json::from_value(serde_json::json!({
+            "metadata": {"generation": 2},
+            "spec": {"replicas": 1, "selector": {"matchLabels": {"app": "api"}}, "template": {
+                "spec": {"containers": [{"name": "api", "image": "nginx:1"}]}
+            }},
+            "status": {"observedGeneration": 1, "readyReplicas": 1, "availableReplicas": 1, "updatedReplicas": 1}
+        })).unwrap();
+        assert!(!RolloutStatus::from_deployment(&deployment, "", "api").workload_complete);
+        deployment.status.as_mut().unwrap().observed_generation = Some(2);
+        assert!(RolloutStatus::from_deployment(&deployment, "", "api").workload_complete);
+    }
+
+    #[test]
+    fn scale_to_zero_waits_for_remaining_pods_to_disappear() {
+        let mut dashboard = ready_dashboard().with_configuration_template(serde_json::json!({}));
+        dashboard.rollout_status.no_pods_expected = true;
+        assert!(!dashboard.is_rollout_complete());
+        dashboard.pods.clear();
+        assert!(dashboard.is_rollout_complete());
+    }
+
+    #[tokio::test]
+    async fn closing_dashboard_stops_background_watchers() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let aborted = task.abort_handle();
+        drop(DashboardTasks(vec![task]));
+        tokio::task::yield_now().await;
+        assert!(aborted.is_finished());
+    }
+
     fn ready_dashboard() -> Dashboard {
         let mut dashboard = Dashboard::new(
             "service".into(),
@@ -866,6 +1027,7 @@ mod deployment_tests {
         dashboard.rollout_status = RolloutStatus {
             template_matches_tag: true,
             workload_complete: true,
+            no_pods_expected: false,
         };
         dashboard
     }
