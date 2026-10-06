@@ -14,6 +14,7 @@ In maritime terms, a **davit** is a crane-like device used to safely lower lifeb
     -   **Wizard Mode:** Interactive selection of environments, services, and image tags (`inquire`).
     -   **Dashboard Mode:** Real-time rollout monitoring with split-screen logs (`ratatui`).
 -   **Visual Diffs:** Preview infrastructure YAML changes before applying them.
+-   **Manual Configuration Changes:** Apply selected edited manifests with `davit apply`, inspect diffs with `d`, choose their order, optionally restart dependent workloads, and commit only the selected files.
 -   **Helm & GitOps:** Discover ArgoCD Applications, update environment values, validate/render charts, and release through Helm or ArgoCD.
 -   **Live Helm Rollout:** Shows pod logs during the upgrade while preserving automatic rollback; closing the dashboard waits for Helm and leaves values uncommitted.
 -   **Automated Auditing:** Keeps the release state in Git; Direct Helm and manifest changes are committed after successful rollout; ArgoCD changes are committed before syncing the exact Git revision.
@@ -127,6 +128,62 @@ davit info --env staging --namespace default --service auth-api
 davit list envs
 davit list services --env staging
 ```
+
+### Applying manually edited manifests
+
+Use `davit apply --env staging` after editing YAML files by hand. This first version supports
+`manifest` sources; Helm and ArgoCD sources are explicitly skipped. Modified files (staged or
+unstaged) and new, non-ignored `.yaml`/`.yml` files inside the environment's configured sources
+are discovered. Deleted files are reported and skipped; this command does not delete resources.
+
+In the selection screen, use **Space** to select files, **d** to preview the highlighted file's
+diff against Git HEAD, **Esc** to return from the diff, and **J/K** to move a file down/up in the
+application order. **Enter** confirms the selection; **Esc** in the list cancels. Arrow keys move
+through the list or scroll the diff. Secret payloads, including annotations, are hidden; changes
+to their hidden values may therefore not appear in the diff.
+
+Davit asks for a commit message, validates all selected snapshots with a server dry run, and
+shows the cluster diff before final approval. Cluster diffs for files containing Secrets are
+hidden. It applies files in the selected order and waits for Deployment, StatefulSet, and DaemonSet
+rollouts. For ConfigMaps and Secrets, it offers to discover referencing workloads in the cluster
+and lets you select which to restart. References in environment variables, volumes, and projected
+volumes are supported. Workloads whose pod templates already changed and completed rollout after
+the configuration changes are excluded from the restart list.
+
+After success, Davit creates one commit per repository and pushes it. Only selected files enter
+the commits, preserving unrelated staged files. No environment release tag is created. Files are
+applied from temporary snapshots; subsequent local edits abort the sequence before committing.
+At the first failure, processing stops with a summary of applied and unapplied files. Local edits
+are retained; cluster changes already made are not automatically rolled back. Git operations
+across repositories are independent, so a later failure can leave earlier repositories pushed.
+
+```bash
+# Interactive selection, diff previews, commit message, and optional restarts
+davit apply --env staging
+
+# Preview without accessing the cluster, changing files, or creating commits
+davit apply --env staging --file k8s/staging/config.yaml --dry-run
+
+# Paths relative to the Git repository root, repeated in application order
+davit apply --env staging \
+  --file k8s/staging/config.yaml --file k8s/staging/deployment.yaml \
+  --message "fix(config): adjust API timeouts" --yes --restart skip \
+  --non-interactive
+
+# Explicitly restart all discovered dependent workloads
+davit apply --env staging --file k8s/staging/config.yaml \
+  --message "fix(config): update settings" --yes --restart all
+```
+
+Absolute paths and paths relative to the current directory are also accepted. If the same
+repository-relative path matches multiple source repositories, pass an absolute path.
+Non-interactive execution requires explicit files, a message, `--yes`, and, for ConfigMaps/Secrets,
+`--restart skip` or `--restart all`. Protected environments still require `--confirm-env NAME`.
+`--no-fetch` skips the usual source refresh. With `--dry-run`, select files explicitly when running
+without a terminal; no commit message or approval is required.
+
+Server validation requires referenced namespaces and resource types to exist already; create a
+new Namespace or CRD in a separate invocation before applying resources that depend on it.
 
 ### Running without a terminal
 

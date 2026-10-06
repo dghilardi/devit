@@ -159,6 +159,29 @@ rendered manifest directly.
 
 ---
 
+### 3.8 Applying Manual Manifest Changes
+
+* `davit apply` discovers modified, staged, and new YAML files within the chosen environment's
+  manifest sources. Helm/ArgoCD sources are skipped; deleted files do not trigger cluster deletion.
+* A multiple-selection terminal screen provides `d` for a diff of the highlighted file against
+  Git HEAD, Space for selection, J/K for application order, and Enter for confirmation.
+* Secret payloads and annotations are hidden in local previews; live diffs containing Secrets
+  are suppressed. Files retain their original formatting on disk.
+* The user supplies a commit message. All selected snapshots receive server-side validation and
+  a live cluster diff before final approval, then are applied sequentially with workload rollout
+  monitoring. Dependencies requiring a new Namespace or CRD must be applied in separate invocations.
+* After ConfigMap/Secret changes, the user can select referencing Deployments, StatefulSets, or
+  DaemonSets for a rollout restart, followed by rollout monitoring. A workload whose pod template
+  already changed and completed rollout after configuration application is not restarted again.
+* After success, selected files are committed and pushed once per repository, preserving other
+  staged changes. This flow creates no release tags. Non-interactive execution requires explicit
+  file selection, message, approval, and a configuration restart policy; dry-run makes no changes.
+* Processing stops on the first error and reports partial application, retaining local edits.
+  Applied resources are not automatically rolled back, and separate repositories are not a single
+  Git transaction. Edits made after selection abort the sequence before committing unapplied content.
+
+---
+
 ## 4. Non-Functional Requirements
 
 ### 4.1 System

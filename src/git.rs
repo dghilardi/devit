@@ -175,6 +175,45 @@ impl Git {
         Ok(())
     }
 
+    /// Commits only the selected paths, preserving unrelated staged changes.
+    pub fn commit_files(path: &Path, message: &str, files: &[std::path::PathBuf]) -> Result<()> {
+        anyhow::ensure!(!files.is_empty(), "No files selected for commit");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("--literal-pathspecs")
+            .arg("add")
+            .arg("--")
+            .args(files)
+            .status()
+            .context("Failed to stage selected manifests")?;
+        anyhow::ensure!(status.success(), "git add failed");
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("--literal-pathspecs")
+            .args(["commit", "--only", "-m", message, "--"])
+            .args(files)
+            .status()
+            .context("Failed to commit selected manifests")?;
+        anyhow::ensure!(status.success(), "git commit failed");
+        Ok(())
+    }
+
+    pub fn push(path: &Path) -> Result<()> {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .arg("push")
+            .status()
+            .context("Failed to push manifest commit")?;
+        anyhow::ensure!(
+            status.success(),
+            "git push failed; the local commit is retained"
+        );
+        Ok(())
+    }
+
     /// Creates and pushes an annotated release tag for HEAD.
     ///
     /// The configured format produces the base name. If that name already

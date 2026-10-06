@@ -1,3 +1,4 @@
+mod apply;
 mod blueprint;
 mod config;
 mod dashboard;
@@ -67,6 +68,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Apply manually edited YAML manifests and commit the selected changes
+    Apply(apply::ApplyArgs),
     /// Deploy a service to an environment
     Deploy {
         /// Target environment (e.g., staging, production)
@@ -174,6 +177,19 @@ async fn main() -> Result<()> {
     let policy = PromptPolicy::resolve(cli.non_interactive);
 
     match cli.command {
+        Commands::Apply(args) => {
+            let env = resolve_environment(&config, args.env.clone(), policy)?;
+            pull_yaml_sources(&env, args.dry_run, args.no_fetch, "application")?;
+            if env.protected.unwrap_or(false) {
+                confirm_protected_environment(
+                    &env.name,
+                    args.confirm_env.as_deref(),
+                    args.dry_run,
+                    policy,
+                )?;
+            }
+            apply::run(&env, args, policy)?;
+        }
         Commands::Deploy {
             env,
             service,
