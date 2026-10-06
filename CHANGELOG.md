@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] 2026-10-06
+
 ### Added
 - Added `davit apply` for manually edited manifests, with multiple file selection, keyboard diff preview, ordered application, optional dependent workload restarts, and targeted Git commits.
 
