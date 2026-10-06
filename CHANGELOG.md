@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] 2026-10-06
+
 ### Added
 - Extended `davit apply` to Helm values and chart YAML, with rendered diffs, grouped upgrades from selected changes, and optional dependent workload restarts.
 
