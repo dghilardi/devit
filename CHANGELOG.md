@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] 2026-10-06
+
 ### Added
 - Apply now shows the live pod and log dashboard during interactive rollouts and configuration restarts, including Helm upgrades, before committing selected changes.
 
