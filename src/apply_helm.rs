@@ -51,76 +51,106 @@ pub fn discover(source: &YamlSource) -> Result<Vec<Release>> {
         ) {
             continue;
         }
-        for application in documents(&fs::read_to_string(&path)?)? {
-            if application["kind"].as_str() != Some("Application") {
+        let applications = match fs::read_to_string(&path)
+            .with_context(|| format!("Cannot read {}", path.display()))
+            .and_then(|content| documents(&content))
+        {
+            Ok(applications) => applications,
+            Err(error) => {
+                eprintln!("Skipping {}: {error:#}", path.display());
                 continue;
             }
-            let sources = application["spec"]["sources"]
-                .as_sequence()
-                .context("Helm apply requires Application spec.sources")?;
-            let charts: Vec<_> = sources
-                .iter()
-                .filter(|s| s["path"].as_str().is_some())
-                .collect();
-            anyhow::ensure!(
-                charts.len() == 1,
-                "Application {} must reference exactly one local chart",
-                path.display()
-            );
-            let chart_source = charts[0];
-            anyhow::ensure!(
-                chart_source["helm"]["parameters"].is_null()
-                    && chart_source["helm"]["values"].is_null()
-                    && chart_source["helm"]["valuesObject"].is_null(),
-                "Application {} uses inline Helm overrides; apply requires file-based values",
-                path.display()
-            );
-            let chart = safe_path(
-                &root,
-                chart_source["path"]
-                    .as_str()
-                    .context("Missing chart path")?,
-            )?;
-            let files = chart_source["helm"]["valueFiles"]
-                .as_sequence()
-                .context("Missing Helm valueFiles")?;
-            let mut values = Vec::new();
-            for file in files {
-                let file = file.as_str().context("Invalid Helm valueFiles entry")?;
-                let value = if let Some(relative) = file.strip_prefix("$values/") {
-                    safe_path(&root, relative)?
-                } else {
-                    anyhow::ensure!(
-                        !file.starts_with('$'),
-                        "Unsupported Helm values reference {file}"
-                    );
-                    safe_path(&chart, file)?
-                };
-                anyhow::ensure!(
-                    value.starts_with(&repo),
-                    "Helm values escape their repository"
-                );
-                values.push(value);
+        };
+        for application in applications {
+            match discover_application(&application, &path, &root, &repo) {
+                Ok(Some(release)) => releases.push(release),
+                Ok(None) => {}
+                Err(error) => eprintln!("Skipping {}: {error:#}", path.display()),
             }
-            let name = chart_source["helm"]["releaseName"]
-                .as_str()
-                .or_else(|| application["metadata"]["name"].as_str())
-                .context("Missing Helm release name")?;
-            releases.push(Release {
-                name: name.into(),
-                namespace: application["spec"]["destination"]["namespace"]
-                    .as_str()
-                    .unwrap_or("default")
-                    .into(),
-                repo: repo.clone(),
-                application: path.canonicalize()?,
-                chart,
-                values,
-            });
         }
     }
     releases.sort();
     Ok(releases)
+}
+
+fn discover_application(
+    application: &serde_yaml::Value,
+    path: &Path,
+    root: &Path,
+    repo: &Path,
+) -> Result<Option<Release>> {
+    if application["kind"].as_str() != Some("Application") {
+        return Ok(None);
+    }
+    let sources = application["spec"]["sources"]
+        .as_sequence()
+        .context("Helm apply requires Application spec.sources")?;
+    let charts: Vec<_> = sources
+        .iter()
+        .filter(|s| s["path"].as_str().is_some())
+        .collect();
+    if charts.is_empty()
+        && let Some(chart) = sources.iter().find_map(|source| source["chart"].as_str())
+    {
+        anyhow::bail!(
+            "Remote Helm chart '{chart}' is not supported by davit apply; only local charts are selectable"
+        );
+    }
+    anyhow::ensure!(
+        charts.len() == 1,
+        "Application {} must reference exactly one local chart",
+        path.display()
+    );
+    let chart_source = charts[0];
+    anyhow::ensure!(
+        chart_source["helm"]["parameters"].is_null()
+            && chart_source["helm"]["values"].is_null()
+            && chart_source["helm"]["valuesObject"].is_null(),
+        "Application {} uses inline Helm overrides; apply requires file-based values",
+        path.display()
+    );
+    let chart = safe_path(
+        root,
+        chart_source["path"]
+            .as_str()
+            .context("Missing chart path")?,
+    )?;
+    let files = chart_source["helm"]["valueFiles"]
+        .as_sequence()
+        .context("Missing Helm valueFiles")?;
+    let mut values = Vec::new();
+    for file in files {
+        let file = file.as_str().context("Invalid Helm valueFiles entry")?;
+        let value = if let Some(relative) = file.strip_prefix("$values/") {
+            safe_path(root, relative)?
+        } else {
+            anyhow::ensure!(
+                !file.starts_with('$'),
+                "Unsupported Helm values reference {file}"
+            );
+            safe_path(&chart, file)?
+        };
+        anyhow::ensure!(
+            value.starts_with(repo),
+            "Helm values escape their repository"
+        );
+        values.push(value);
+    }
+    let name = chart_source["helm"]["releaseName"]
+        .as_str()
+        .or_else(|| application["metadata"]["name"].as_str())
+        .context("Missing Helm release name")?;
+    Ok(Some(Release {
+        name: name.into(),
+        namespace: application["spec"]["destination"]["namespace"]
+            .as_str()
+            .unwrap_or("default")
+            .into(),
+        repo: repo.to_path_buf(),
+        application: path.canonicalize()?,
+        chart,
+        values,
+    }))
 }
 
 fn safe_path(root: &Path, relative: &str) -> Result<PathBuf> {

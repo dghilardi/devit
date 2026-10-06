@@ -181,6 +181,8 @@ rendered manifest directly.
   to a shared chart or values file. Release order follows the first selected input. Helm metadata
   discovery does not require a registry image, and all declared values files and the release namespace
   are retained. Image tags are not rewritten.
+* Unsupported or invalid Helm Applications are reported and skipped independently so remote charts
+  or broken metadata do not block applicable changes in other releases. Their inputs are not selectable.
 * Helm charts and values are snapshotted from Git HEAD plus selected files only, linted, rendered,
   validated, and upgraded with `--atomic --wait`. Unselected working-copy changes remain excluded.
   Chart dependencies must exist in Git HEAD; Application routing changes, inline overrides, and
